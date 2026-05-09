@@ -1,0 +1,231 @@
+# 企业微信客服 - 多接待人员配置示例
+# 
+# 本文件展示了如何配置 ServicerUserIDs 实现轮询分配
+# 复制相关配置到你的实际配置文件中
+
+# ============================================
+# 示例1: 基础轮询配置（推荐新手使用）
+# ============================================
+WeCom:
+  Port: 8887
+  CorpID: wwxxxxxxxxxxxxx
+  Token: your_token
+  EncodingAESKey: your_encoding_aes_key
+  MultipleApplication:
+    - AgentID: 1000001
+      AgentSecret: your_agent_secret
+      ManageAllKFSession: true
+      Model: "gpt-3.5-turbo"
+      BasePrompt: "你是ChatGPT助手"
+      Welcome: "您好！我是AI助手"
+      
+      # 方式1: 多个客服轮询（新增功能，推荐）
+      ServicerUserIDs:
+        - "zhangsan"
+        - "lisi"
+        - "wangwu"
+      
+      # 排队等待模式（更灵活）
+      ServiceState: 2
+
+---
+
+# ============================================
+# 示例2: 直接指定模式 + 轮询分配
+# ============================================
+WeCom:
+  MultipleApplication:
+    - AgentID: 1000001
+      AgentSecret: your_agent_secret
+      ManageAllKFSession: true
+      
+      # 专属客服团队，直接指定
+      ServicerUserIDs:
+        - "vip_kefu_01"
+        - "vip_kefu_02"
+      
+      # 直接指定接待（需要客服处于"正在接待"状态）
+      ServiceState: 3
+
+---
+
+# ============================================
+# 示例3: 兼容旧配置（单客服）
+# ============================================
+WeCom:
+  MultipleApplication:
+    - AgentID: 1000001
+      AgentSecret: your_agent_secret
+      ManageAllKFSession: true
+      
+      # 单个客服（旧方式，仍然可用）
+      ServicerUserID: "kefu_manager"
+      
+      ServiceState: 3
+
+---
+
+# ============================================
+# 示例4: 混合配置（新旧结合）
+# ============================================
+WeCom:
+  MultipleApplication:
+    - AgentID: 1000001
+      AgentSecret: your_agent_secret
+      ManageAllKFSession: true
+      
+      # 优先使用列表轮询
+      ServicerUserIDs:
+        - "kefu_a"
+        - "kefu_b"
+        - "kefu_c"
+      
+      # 备用配置（如果列表为空时使用）
+      ServicerUserID: "default_kefu"
+      
+      ServiceState: 3
+
+---
+
+# ============================================
+# 示例5: 多应用不同配置
+# ============================================
+WeCom:
+  MultipleApplication:
+    # 应用1: 普通客服 - 排队等待
+    - AgentID: 1000001
+      AgentSecret: secret_1
+      ManageAllKFSession: true
+      ServicerUserIDs:
+        - "general_kefu_1"
+        - "general_kefu_2"
+      ServiceState: 2
+    
+    # 应用2: VIP客服 - 直接指定
+    - AgentID: 1000002
+      AgentSecret: secret_2
+      ManageAllKFSession: true
+      ServicerUserIDs:
+        - "vip_kefu_1"
+        - "vip_kefu_2"
+      ServiceState: 3
+    
+    # 应用3: 专属客服 - 单人负责
+    - AgentID: 1000003
+      AgentSecret: secret_3
+      ManageAllKFSession: false
+      ServicerUserID: "exclusive_kefu"
+      ServiceState: 3
+
+---
+
+# ============================================
+# 示例6: 环境变量配置方式
+# ============================================
+# 如果使用环境变量而非 YAML 文件：
+#
+# WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_0=zhangsan
+# WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_1=lisi
+# WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_2=wangwu
+# WECOM_MULTIPLEAPPLICATION_0_SERVICESTATE=3
+#
+# 或者在 docker-compose.yml 中：
+# environment:
+#   - WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_0=zhangsan
+#   - WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_1=lisi
+#   - WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_2=wangwu
+#   - WECOM_MULTIPLEAPPLICATION_0_SERVICESTATE=3
+
+---
+
+# ============================================
+# 示例7: Docker Compose 完整配置
+# ============================================
+# version: '3'
+# services:
+#   chatgpt-wechat:
+#     image: your-image
+#     environment:
+#       # 企业微信基础配置
+#       - WECOM_CORPID=wwxxxxxxxxxxxxx
+#       - WECOM_TOKEN=your_token
+#       - WECOM_ENCODINGAESKEY=your_encoding_aes_key
+#       
+#       # 第一个应用配置
+#       - WECOM_MULTIPLEAPPLICATION_0_AGENTID=1000001
+#       - WECOM_MULTIPLEAPPLICATION_0_AGENTSECRET=your_secret
+#       - WECOM_MULTIPLEAPPLICATION_0_MANAGEALLKFSESSION=true
+#       - WECOM_MULTIPLEAPPLICATION_0_MODEL=gpt-3.5-turbo
+#       
+#       # 多客服轮询配置
+#       - WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_0=kefu001
+#       - WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_1=kefu002
+#       - WECOM_MULTIPLEAPPLICATION_0_SERVICERUSERIDS_2=kefu003
+#       
+#       # 服务状态
+#       - WECOM_MULTIPLEAPPLICATION_0_SERVICESTATE=3
+#       
+#       # Redis 配置
+#       - REDIS_HOST=redis:6379
+#       - REDIS_PASSWORD=your_redis_password
+#     
+#     depends_on:
+#       - redis
+#   
+#   redis:
+#     image: redis:7-alpine
+#     command: redis-server --requirepass your_redis_password
+#     volumes:
+#       - redis-data:/data
+# 
+# volumes:
+#   redis-data:
+
+---
+
+# ============================================
+# 配置说明
+# ============================================
+#
+# ServicerUserID (字符串):
+#   - 单个接待人员的 userid
+#   - 用于向后兼容，仍然可以使用
+#   - 当 ServicerUserIDs 未配置时生效
+#
+# ServicerUserIDs (字符串数组):
+#   - 多个接待人员的 userid 列表
+#   - 系统会自动轮询分配
+#   - 优先级高于 ServicerUserID
+#   - 第一次请求分配给第1个，第二次给第2个，以此循环
+#
+# ServiceState (整数):
+#   - 2: 排队等待接待（推荐）
+#       用户进入待接入池，任何可用客服都可接入
+#   - 3: 直接指定接待
+#       直接转给指定的客服，该客服必须处于"正在接待"状态
+#
+# 注意事项:
+#   1. 所有配置的 userid 必须在企业微信中已激活
+#   2. 当 ServiceState=3 时，客服必须处于"正在接待"状态
+#   3. 第三方应用需要使用 open_userid（密文userid）
+#   4. 轮询索引存储在 Redis 中，自动维护
+#   5. 可以随时修改列表，重启后生效
+
+---
+
+# ============================================
+# 测试配置是否正确
+# ============================================
+#
+# 1. 启动服务后，查看日志确认配置加载成功
+#    docker logs chatgpt-wechat | grep "配置信息"
+#
+# 2. 在企业微信中发送"人工客服"触发转人工
+#
+# 3. 观察日志中的轮询分配信息
+#    docker logs chatgpt-wechat | grep "轮询分配"
+#
+# 4. 检查 Redis 中的索引
+#    redis-cli GET chat:servicer:roundrobin:YOUR_OPEN_KF_ID
+#
+# 5. 连续发起多次请求，验证是否按顺序分配

@@ -47,6 +47,8 @@ type Application struct {
 	AgentID            int64
 	AgentSecret        string
 	ManageAllKFSession bool
+	ServicerUserID     string // 接待人员userid，转人工时使用
+	ServiceState       int    // 转人工时的服务状态：2-排队等待接待 3-直接指定接待人员
 }
 
 // SendToWeComUser 发送应用消息给用户
@@ -848,4 +850,105 @@ func getCustomerApp() (*workwx.WorkwxApp, bool) {
 	// 然后把数据 发给微信用户
 	app := workwx.New(WeCom.CorpID, workwx.WithQYAPIHost(WeCom.QYAPIHost)).WithApp(defaultAgentSecret, defaultAgentId)
 	return app, true
+}
+
+// TransferToHumanServiceState 转人工客服 - 变更会话状态
+// openKfID: 客服账号ID
+// externalUserID: 客户UserID
+// serviceState: 服务状态
+//   - 0: 未处理
+//   - 1: 由AI接待
+//   - 2: 在待接入池中排队等待接待人员接入（可选择转为指定人员接待）
+//   - 3: 人工接待中，直接指定接待人员（接待人员须处于"正在接待"中）
+// servicerUserID: 接待人员的userid，当state=3时必填，第三方应用填密文userid（open_userid）
+func TransferToHumanServiceState(openKfID, externalUserID string, serviceState int, servicerUserID string) error {
+	app, ok := getCustomerApp()
+	if !ok {
+		logx.Info("客服消息-获取 app 失败")
+		return fmt.Errorf("获取客服应用失败")
+	}
+	
+	// 当 serviceState=3 时，servicerUserID 为必填
+	if serviceState == 3 && servicerUserID == "" {
+		logx.Error("转人工客服-servicer_userid不能为空")
+		return fmt.Errorf("转人工客服失败: 接待人员userid不能为空")
+	}
+	
+	token := app.GetAccessToken()
+	
+	// 请求地址: https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token=ACCESS_TOKEN
+	url := fmt.Sprintf("%s/cgi-bin/kf/service_state/trans?access_token=%s", WeCom.QYAPIHost, token)
+	
+	// 构造请求体
+	type ServiceStateReq struct {
+		OpenKfid       string `json:"open_kfid"`
+		ExternalUserid string `json:"external_userid"`
+		ServiceState   int    `json:"service_state"`
+		ServicerUserID string `json:"servicer_userid,omitempty"`
+	}
+	
+	reqBody := ServiceStateReq{
+		OpenKfid:       openKfID,
+		ExternalUserid: externalUserID,
+		ServiceState:   serviceState,
+		ServicerUserID: servicerUserID,
+	}
+	
+	// 打印请求参数用于调试
+	logx.Info("转人工客服-请求参数", 
+		"url:", url,
+		"openKfID:", openKfID,
+		"externalUserID:", externalUserID,
+		"serviceState:", serviceState,
+		"servicerUserID:", servicerUserID)
+	
+	b, err := json.Marshal(reqBody)
+	if err != nil {
+		logx.Error("转人工客服-请求参数json构造错误", err.Error())
+		return err
+	}
+	
+	logx.Info("转人工客服-请求JSON", string(b))
+	
+	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	if err != nil {
+		logx.Error("转人工客服-请求错误", err.Error())
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+	
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logx.Error("转人工客服-响应读取错误", err.Error())
+		return err
+	}
+	
+	// 打印响应内容用于调试
+	logx.Info("转人工客服-响应内容", string(body))
+	
+	// 解析响应
+	type ServiceStateResp struct {
+		Errcode int    `json:"errcode"`
+		Errmsg  string `json:"errmsg"`
+	}
+	
+	var result ServiceStateResp
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		logx.Error("转人工客服-响应解析错误", err.Error())
+		return err
+	}
+	
+	if result.Errcode != 0 {
+		logx.Error("转人工客服-API返回错误", 
+			"errcode:", result.Errcode, 
+			"errmsg:", result.Errmsg,
+			"servicerUserID:", servicerUserID)
+		return fmt.Errorf("转人工客服失败: %s (错误码: %d)", result.Errmsg, result.Errcode)
+	}
+	
+	logx.Info("转人工客服-成功", "openKfID:", openKfID, "externalUserID:", externalUserID, "servicerUserID:", servicerUserID)
+	return nil
 }

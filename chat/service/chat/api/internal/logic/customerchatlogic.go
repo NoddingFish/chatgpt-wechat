@@ -18,6 +18,7 @@ import (
 	"chat/common/openai"
 	"chat/common/plugin"
 	"chat/common/redis"
+	"chat/common/wecom"
 	"chat/service/chat/api/internal/svc"
 	"chat/service/chat/api/internal/types"
 	"chat/service/chat/model"
@@ -85,24 +86,24 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 	if l.svcCtx.Config.ModelProvider.Company == "dify" {
 		c := dify.NewClient(l.svcCtx.Config.Dify.Host, l.svcCtx.Config.Dify.Key)
 
-		request := dify.WorkflowRequest{
+		// 从 redis 中获取会话 ID
+		cacheKey := fmt.Sprintf(redis.DifyCustomerConversationKey, req.OpenKfID, req.CustomerID)
+		conversationId, _ := redis.Rdb.Get(context.Background(), cacheKey).Result()
+
+		request := &dify.ChatMessageRequest{
 			Query:        req.Msg,
 			User:         req.CustomerID,
 			ResponseMode: "streaming",
-			Inputs:       map[string]any{},
+			Inputs:       map[string]interface{}{},
+		}
+		// 只有在 conversationId 非空时才设置
+		if conversationId != "" {
+			request.ConversationID = conversationId
 		}
 		if len(l.svcCtx.Config.Dify.Inputs) > 0 {
 			for _, v := range l.svcCtx.Config.Dify.Inputs {
 				request.Inputs[v.Key] = v.Value
 			}
-		}
-
-		// 从 redis 中获取会话 ID
-		cacheKey := fmt.Sprintf(redis.DifyCustomerConversationKey, req.OpenKfID, req.CustomerID)
-		conversationId, err := redis.Rdb.Get(context.Background(), cacheKey).Result()
-		if err == nil && conversationId != "" {
-			// 如果有会话ID，使用已有的会话ID
-			request.ConversationId = conversationId
 		}
 
 		go func() {
@@ -118,116 +119,93 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 					rs          []rune
 				)
 
-				// 创建自定义的 EventHandler
-				handler := &difyCustomerEventHandler{
-					logger: l.Logger,
-					onStreamingResponse: func(resp dify.StreamingResponse) {
-						l.Logger.Debug("Received streaming response:", resp)
-
-						// 获取文本内容，通常在outputs中的text字段
-						var textContent string
-						if resp.Event == dify.EventWorkflowStarted {
-							//go sendToUser(req.OpenKfID, req.CustomerID, "我们已经收到了您的请求正在处理中...", l.svcCtx.Config)
-							// 去将 conversation_id 存入 redis
-							if resp.ConversationID != "" {
-								cacheKey := fmt.Sprintf(redis.DifyCustomerConversationKey, req.OpenKfID, req.CustomerID)
-								redis.Rdb.Set(context.Background(), cacheKey, resp.ConversationID, 24*time.Hour)
-							}
-						}
-
-						if resp.Event == dify.EventWorkflowFinished {
-							if resp.Data.Outputs != nil {
-								if textVal, ok := resp.Data.Outputs["answer"]; ok {
-									if text, ok := textVal.(string); ok {
-										textContent = text
-									}
-								}
-							}
-							rs = []rune(textContent)
-							messageText = textContent
-
-							// 根据原始请求类型决定响应方式
-							if l.isVoiceRequest && l.svcCtx.Config.Dify.ResponseWithVoice {
-								// 语音请求，需要对文本进行分段处理
-								go func() {
-									// 将文本按照自然段落分割
-									segments := splitTextIntoSegments(messageText, 160)
-									for _, segment := range segments {
-										response, err := c.API().TextToAudio(context.Background(), segment)
-										if err != nil {
-											l.Logger.Error("dify 生成语音失败: ", err)
-											continue
-										}
-
-										uuidObj, _ := uuid.NewUUID()
-										// build file path
-										filePath := fmt.Sprintf("%s/%s-%s", os.TempDir(), req.OpenKfID, uuidObj.String())
-										// save voice
-										filePath, err = dify.SaveAudioToFile(response.Audio, filePath, response.ContentType)
-										if err != nil {
-											l.Logger.Error("dify 保存语音文件失败: ", err)
-											continue
-										}
-
-										// 发送语音消息
-										sendToUser(req.OpenKfID, req.CustomerID, "", l.svcCtx.Config, filePath)
-
-										// 添加短暂延迟，避免消息发送太快
-										time.Sleep(200 * time.Millisecond)
-									}
-
-									// 最后发送完整文本作为备份
-									if len(segments) <= 0 {
-										sendToUser(req.OpenKfID, req.CustomerID, messageText+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
-									}
-								}()
-							} else {
-								// 文本请求，发送文本回复
-								go sendToUser(req.OpenKfID, req.CustomerID, string(rs)+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
-							}
-
-							// 将对话记录存储到数据库
-							table := l.svcCtx.ChatModel.Chat
-							_ = table.WithContext(context.Background()).Create(&model.Chat{
-								User:       req.CustomerID,
-								OpenKfID:   req.OpenKfID,
-								MessageID:  req.MsgID,
-								ReqContent: req.Msg,
-								ResContent: messageText,
-							})
-						}
-					},
-					onTTSMessage: func(msg dify.TTSMessage) {
-						l.Logger.Debug("Received TTS message:", msg)
-					},
-					onError: func(err error) {
-						errInfo := err.Error()
-						if strings.Contains(errInfo, "maximum context length") {
-							errInfo += "\n 请使用 #clear 清理所有上下文"
-						}
-						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
-					},
-				}
-
-				err := c.API().RunStreamWorkflowWithHandler(ctx, request, handler)
+				// 使用 Chat API 的流式响应
+				streamChannel, err := c.API().ChatMessagesStream(ctx, request)
 				if err != nil {
 					errInfo := err.Error()
 					if strings.Contains(errInfo, "maximum context length") {
 						errInfo += "\n 请使用 #clear 清理所有上下文"
 					}
 					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
+					return
+				}
+
+				// 处理流式响应
+				for response := range streamChannel {
+					if response.Err != nil {
+						errInfo := response.Err.Error()
+						if strings.Contains(errInfo, "maximum context length") {
+							errInfo += "\n 请使用 #clear 清理所有上下文"
+						}
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
+						return
+					}
+
+					// 保存 conversation_id 到 redis
+					if response.ConversationID != "" {
+						cacheKey := fmt.Sprintf(redis.DifyCustomerConversationKey, req.OpenKfID, req.CustomerID)
+						redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour)
+					}
+
+					// 累积回答文本
+					if response.Answer != "" {
+						rs = append(rs, []rune(response.Answer)...)
+						messageText = string(rs)
+					}
+				}
+
+				// 流式响应结束，发送完整消息
+				if len(rs) > 0 {
+					// 根据原始请求类型决定响应方式
+					if l.isVoiceRequest && l.svcCtx.Config.Dify.ResponseWithVoice {
+						// 语音请求，需要对文本进行分段处理
+						go func() {
+							segments := splitTextIntoSegments(messageText, 160)
+							for _, segment := range segments {
+								response, err := c.API().TextToAudio(context.Background(), segment)
+								if err != nil {
+									l.Logger.Error("dify 生成语音失败: ", err)
+									continue
+								}
+
+								uuidObj, _ := uuid.NewUUID()
+								filePath := fmt.Sprintf("%s/%s-%s", os.TempDir(), req.OpenKfID, uuidObj.String())
+								filePath, err = dify.SaveAudioToFile(response.Audio, filePath, response.ContentType)
+								if err != nil {
+									l.Logger.Error("dify 保存语音文件失败: ", err)
+									continue
+								}
+
+								sendToUser(req.OpenKfID, req.CustomerID, "", l.svcCtx.Config, filePath)
+								time.Sleep(200 * time.Millisecond)
+							}
+
+							if len(segments) <= 0 {
+								sendToUser(req.OpenKfID, req.CustomerID, messageText+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
+							}
+						}()
+					} else {
+						// 文本请求，发送文本回复
+						go sendToUser(req.OpenKfID, req.CustomerID, string(rs)+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
+					}
+
+					// 将对话记录存储到数据库
+					table := l.svcCtx.ChatModel.Chat
+					_ = table.WithContext(context.Background()).Create(&model.Chat{
+						User:       req.CustomerID,
+						OpenKfID:   req.OpenKfID,
+						MessageID:  req.MsgID,
+						ReqContent: req.Msg,
+						ResContent: messageText,
+					})
 				}
 			} else {
 				l.Logger.Debug("dify 处理 非流式响应: ", request)
-				// 非流式响应 - 需要将 WorkflowRequest 转换为 ChatMessageRequest
-				chatRequest := &dify.ChatMessageRequest{
-					Query:        request.Query,
-					User:         request.User,
-					ResponseMode: "blocking",
-					Inputs:       request.Inputs,
-				}
-
-				resp, err := c.API().ChatMessages(ctx, chatRequest)
+				// 非流式响应
+				blockingRequest := *request
+				blockingRequest.ResponseMode = "blocking"
+				
+				resp, err := c.API().ChatMessages(ctx, &blockingRequest)
 				if err != nil {
 					errInfo := err.Error()
 					if strings.Contains(errInfo, "maximum context length") {
@@ -238,6 +216,12 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 				}
 
 				messageText := resp.Answer
+
+				// 保存 conversation_id 到 redis
+				if resp.ConversationID != "" {
+					cacheKey := fmt.Sprintf(redis.DifyCustomerConversationKey, req.OpenKfID, req.CustomerID)
+					redis.Rdb.Set(context.Background(), cacheKey, resp.ConversationID, 24*time.Hour)
+				}
 
 				// 把数据发给微信用户
 				go sendToUser(req.OpenKfID, req.CustomerID, messageText, l.svcCtx.Config)
@@ -825,6 +809,14 @@ func (l *CustomerChatLogic) FactoryCommend(req *types.CustomerChatReq) (proceed 
 	template := make(map[string]CustomerTemplateData)
 	//当 message 以 # 开头时，表示是特殊指令
 	if !strings.HasPrefix(req.Msg, "#") {
+		// 检测是否包含"人工"或"人工客服"关键词
+		msgLower := strings.ToLower(req.Msg)
+		if strings.Contains(msgLower, "人工客服") || strings.Contains(msgLower, "人工") {
+			// 转人工客服
+			transferHandler := CustomerCommendTransferToHuman{}
+			proceed = transferHandler.customerExec(l, req)
+			return proceed, nil
+		}
 		return true, nil
 	}
 
@@ -983,6 +975,78 @@ type CustomerCommendDirect struct{}
 func (p CustomerCommendDirect) customerExec(l *CustomerChatLogic, req *types.CustomerChatReq) bool {
 	msg := strings.Replace(req.Msg, "#direct:", "", -1)
 	sendToUser(req.OpenKfID, req.CustomerID, msg, l.svcCtx.Config)
+	return false
+}
+
+type CustomerCommendTransferToHuman struct{}
+
+func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *types.CustomerChatReq) bool {
+	// 调用企业微信 API 转人工客服
+	// service_state: 0-未处理 1-由AI接待 2-由人工接待 3-已转人工
+	
+	// 获取配置的服务状态和接待人员ID
+	serviceState := 2 // 默认值：排队等待接待
+	servicerUserID := ""
+	
+	for _, app := range l.svcCtx.Config.WeCom.MultipleApplication {
+		if app.ManageAllKFSession {
+			if app.ServiceState > 0 {
+				serviceState = app.ServiceState
+			}
+			
+			// 优先使用 ServicerUserIDs 列表进行轮询分配
+			if len(app.ServicerUserIDs) > 0 {
+				// 使用 Redis 实现轮询分配
+				cacheKey := fmt.Sprintf("chat:servicer:roundrobin:%s", req.OpenKfID)
+				currentIndex, err := redis.Rdb.Get(context.Background(), cacheKey).Int()
+				if err != nil {
+					currentIndex = 0
+				}
+				
+				// 获取当前接待人员
+				servicerUserID = app.ServicerUserIDs[currentIndex%len(app.ServicerUserIDs)]
+				
+				// 更新索引到下一个
+				nextIndex := (currentIndex + 1) % len(app.ServicerUserIDs)
+				_ = redis.Rdb.Set(context.Background(), cacheKey, nextIndex, 0).Err()
+				
+				logx.Info("转人工客服-轮询分配", 
+					"openKfID:", req.OpenKfID,
+					"totalServicers:", len(app.ServicerUserIDs),
+					"currentIndex:", currentIndex,
+					"assignedServicer:", servicerUserID)
+			} else if app.ServicerUserID != "" {
+				// 如果没有配置列表，使用单个 ServicerUserID（兼容旧配置）
+				servicerUserID = app.ServicerUserID
+			}
+			break
+		}
+	}
+	
+	logx.Info("转人工客服-配置信息", 
+		"openKfID:", req.OpenKfID,
+		"customerID:", req.CustomerID,
+		"serviceState:", serviceState,
+		"servicerUserID:", servicerUserID)
+	
+	// 如果 serviceState=3，则 servicerUserID 必填
+	if serviceState == 3 && servicerUserID == "" {
+		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败: 系统未配置默认接待人员，请联系管理员配置", l.svcCtx.Config)
+		return false
+	}
+	
+	err := wecom.TransferToHumanServiceState(req.OpenKfID, req.CustomerID, serviceState, servicerUserID)
+	if err != nil {
+		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败:"+err.Error(), l.svcCtx.Config)
+		return false
+	}
+	
+	// 根据服务状态返回不同的提示
+	if serviceState == 2 {
+		sendToUser(req.OpenKfID, req.CustomerID, "已为您提交人工客服申请，请在待接入池中等待接待人员接入~", l.svcCtx.Config)
+	} else {
+		sendToUser(req.OpenKfID, req.CustomerID, "已为您转接人工客服，请耐心等待~", l.svcCtx.Config)
+	}
 	return false
 }
 

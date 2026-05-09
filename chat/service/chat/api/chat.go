@@ -62,6 +62,8 @@ func main() {
 			AgentID:            v.AgentID,
 			AgentSecret:        v.AgentSecret,
 			ManageAllKFSession: v.ManageAllKFSession,
+			ServicerUserID:     v.ServicerUserID,
+			ServiceState:       v.ServiceState,
 		})
 	}
 
