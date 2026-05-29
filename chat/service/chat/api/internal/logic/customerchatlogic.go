@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"chat/common/coze"
 	"chat/common/deepseek"
 	"chat/common/dify"
 	"chat/common/gemini"
@@ -204,7 +205,7 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 				// 非流式响应
 				blockingRequest := *request
 				blockingRequest.ResponseMode = "blocking"
-				
+
 				resp, err := c.API().ChatMessages(ctx, &blockingRequest)
 				if err != nil {
 					errInfo := err.Error()
@@ -236,6 +237,455 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 					ResContent: messageText,
 				})
 				l.Logger.Debug("dify 处理完成: ", messageText)
+			}
+		}()
+
+		return &types.CustomerChatReply{
+			Message: "ok",
+		}, nil
+	}
+
+	// coze 处理
+	if l.svcCtx.Config.ModelProvider.Company == "coze" {
+		l.Logger.Info("进入 Coze 处理逻辑, BotID: ", l.svcCtx.Config.Coze.BotID)
+		c := coze.NewClient(l.svcCtx.Config.Coze.Host, l.svcCtx.Config.Coze.Key)
+
+		// 从 redis 中获取会话 ID
+		cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+		conversationId, err := redis.Rdb.Get(context.Background(), cacheKey).Result()
+		if err != nil {
+			l.Logger.Info("Coze 首次对话，无历史会话 ID")
+		} else {
+			l.Logger.Info("Coze 从 Redis 获取到会话 ID: ", conversationId)
+		}
+
+		// 显式设置 auto_save_history 为 true，让 Coze 自动管理会话历史
+		// 这是 Coze V3 的默认行为，保持与 curl 调用一致
+		autoSaveHistory := true
+		request := &coze.ChatMessageRequest{
+			BotID: l.svcCtx.Config.Coze.BotID,
+			User:  req.CustomerID,
+			Messages: []coze.ChatMessage{
+				{
+					Role:        "user",
+					Content:     req.Msg,
+					ContentType: "text",
+					Type:        "question", // Coze V3 需要此字段来正确识别消息类型
+				},
+			},
+			AutoSaveHistory: &autoSaveHistory, // 显式设置为 true
+		}
+		// 只有在 conversationId 非空时才设置
+		if conversationId != "" {
+			request.ConversationID = conversationId
+			l.Logger.Info("Coze 请求中使用历史会话 ID: ", request.ConversationID)
+		} else {
+			l.Logger.Info("Coze 请求将创建新会话（无历史会话 ID）")
+		}
+
+		// 打印 Coze API 请求详细信息
+		fmt.Println("\n========== [Coze V3 API 请求详情] ==========")
+		fmt.Printf("API Host: %s\n", l.svcCtx.Config.Coze.Host)
+		fmt.Printf("完整 URL: %s/v3/chat\n", l.svcCtx.Config.Coze.Host)
+		fmt.Printf("BotID: %s\n", request.BotID)
+		fmt.Printf("UserID: %s\n", request.User)
+		if len(request.Messages) > 0 {
+			fmt.Printf("AdditionalMessages[%d]: Role=%s, Content=%s, ContentType=%s, Type=%s\n",
+				len(request.Messages), request.Messages[0].Role, request.Messages[0].Content, request.Messages[0].ContentType, request.Messages[0].Type)
+		}
+		fmt.Printf("ConversationID: %s\n", request.ConversationID)
+		fmt.Printf("AutoSaveHistory: %v\n", *request.AutoSaveHistory)
+		fmt.Printf("Stream: %v\n", l.svcCtx.Config.Response.Stream)
+		fmt.Println("=========================================\n")
+
+		go func() {
+			ctx := context.Background()
+			// 设置超时时间为 200 秒
+			ctx, cancel := context.WithTimeout(ctx, 200*time.Second)
+			defer cancel()
+
+			l.Logger.Info("Coze V3 请求参数: BotID=", request.BotID, ", User=", request.User, ", ConversationID=", request.ConversationID)
+			if len(request.Messages) > 0 {
+				l.Logger.Info("Coze V3 消息内容: Role=", request.Messages[0].Role, ", Content=", request.Messages[0].Content)
+			}
+			l.Logger.Info("Coze V3 响应模式 - 流式: ", l.svcCtx.Config.Response.Stream)
+
+			// Coze API v2 建议使用流式响应
+			// 如果配置为非流式，也尝试使用，但可能会返回空结果
+			useStream := true // 默认使用流式
+
+			if useStream {
+				var (
+					messageText       string
+					rs                []rune
+					chatID            string // 保存 chat_id 用于后续获取消息
+					newConversationID string // 保存 Coze 返回的新 conversation_id
+				)
+
+				// 使用 Chat API 的流式响应
+				streamChannel, err := c.API().ChatMessagesStream(ctx, request)
+				if err != nil {
+					errInfo := err.Error()
+					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
+					return
+				}
+
+				// 处理流式响应
+				for response := range streamChannel {
+					if response.Err != nil {
+						errInfo := response.Err.Error()
+						l.Logger.Error("coze V3 流式响应错误: ", errInfo)
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
+						return
+					}
+
+					// 打印所有接收到的事件用于调试
+					l.Logger.Info(fmt.Sprintf("Coze V3 Stream Event: '%s', HasData: %v", response.Event, response.Data != nil))
+					if response.Data != nil {
+						l.Logger.Info(fmt.Sprintf("  Data Type: '%s', Role: '%s', Content Length: %d",
+							response.Data.Type, response.Data.Role, len(response.Data.Content)))
+						if len(response.Data.Content) < 100 {
+							l.Logger.Info(fmt.Sprintf("  Content: '%s'", response.Data.Content))
+						}
+					} else {
+						// 额外调试：检查是否是预期的无数据事件
+						if response.Event == "conversation.message.delta" || response.Event == "conversation.message.completed" {
+							l.Logger.Error(fmt.Sprintf("⚠️ 关键事件 '%s' 的 Data 为 nil！这可能是一个 bug", response.Event))
+						}
+					}
+
+					// 检查是否有错误状态
+					if response.LastError != nil && response.LastError.Code != 0 {
+						errMsg := fmt.Sprintf("Coze API 错误 [%d]: %s", response.LastError.Code, response.LastError.Msg)
+						l.Logger.Error(errMsg)
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errMsg, l.svcCtx.Config)
+						return
+					}
+
+					// 检查会话状态
+					if response.Status == "failed" {
+						l.Logger.Error("Coze V3 会话失败")
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:Coze 会话处理失败", l.svcCtx.Config)
+						return
+					}
+
+					// 保存 conversation_id 到 redis（优先从顶层字段获取）
+					if response.ConversationID != "" {
+						// 保存新的 conversation_id 供后续使用
+						newConversationID = response.ConversationID
+
+						// 关键修复：只有当请求中没有传入 conversation_id 时，才保存新的会话 ID
+						// 这样可以避免 Coze 返回的新 ID 覆盖已有的会话 ID
+						if request.ConversationID == "" {
+							// 首次对话，保存新创建的会话 ID
+							l.Logger.Info("Coze V3 创建新会话 ID: ", response.ConversationID)
+							cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+							err := redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
+							if err != nil {
+								l.Logger.Error("Coze 保存会话 ID 到 Redis 失败: ", err)
+							} else {
+								l.Logger.Info("Coze 会话 ID 已保存到 Redis")
+							}
+						} else if response.ConversationID != request.ConversationID {
+							// 传入了会话 ID，但 Coze 返回了不同的 ID
+							// 这说明 Coze 认为旧会话已失效或不存在，需要更新为新 ID
+							l.Logger.Info(fmt.Sprintf("⚠️ Coze V3 返回的会话 ID 与请求不同 - 请求: %s, 响应: %s",
+								request.ConversationID, response.ConversationID))
+							l.Logger.Info("更新 Redis 中的会话 ID 为新值: ", response.ConversationID)
+
+							// 更新 Redis 中的 conversation_id
+							cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+							err := redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
+							if err != nil {
+								l.Logger.Error("Coze 更新会话 ID 到 Redis 失败: ", err)
+							} else {
+								l.Logger.Info("Coze 会话 ID 已更新到 Redis")
+							}
+						} else {
+							// 返回的 ID 与请求一致，无需操作
+							l.Logger.Debug("Coze V3 返回会话 ID (与请求一致): ", response.ConversationID)
+						}
+					}
+
+					// 保存 chat_id （从 completed 事件的 id 字段获取）
+					if response.Event == "conversation.chat.completed" && response.ID != "" {
+						chatID = response.ID
+						l.Logger.Info("Coze V3 返回 Chat ID: ", chatID)
+					}
+
+					// 累积回答文本 - V3 API 使用 Data.Type 来判断消息类型
+					// 处理 conversation.message.delta 和 conversation.message.completed 事件
+					if (response.Event == "conversation.message.delta" || response.Event == "conversation.message.completed") && response.Data != nil {
+						l.Logger.Debug(fmt.Sprintf("Coze V3 流式响应 - Event: '%s', Type: '%s', Role: '%s', Content Length: %d",
+							response.Event, response.Data.Type, response.Data.Role, len(response.Data.Content)))
+
+						// 关键修复：累积所有 assistant 角色的 answer 类型消息
+						// 不要过滤 type，因为 Coze 可能将长回复分成多个 delta 事件
+						if response.Data.Role == "assistant" && response.Data.Type == "answer" && response.Data.Content != "" {
+							l.Logger.Debug("coze V3 流式响应片段: ", response.Data.Content)
+							rs = append(rs, []rune(response.Data.Content)...)
+							messageText = string(rs)
+						} else if response.Data.Content != "" {
+							// 记录其他类型的消息，用于调试
+							l.Logger.Info(fmt.Sprintf("Coze V3 收到非 answer 类型消息 - Type: '%s', Role: '%s', Content: '%s'",
+								response.Data.Type, response.Data.Role, response.Data.Content))
+						}
+					}
+				}
+
+				// 流式响应结束
+				// 关键修复：始终使用 GetMessageListByChatID 获取完整消息，避免流式响应内容不完整
+				l.Logger.Info("coze 流式响应结束，通过 GetMessageList 获取完整消息")
+				l.Logger.Info(fmt.Sprintf("流式响应累积的内容长度: %d, 内容预览: %s", len(rs), messageText))
+
+				// 使用 Coze 返回的新 conversation_id
+				useConversationID := newConversationID
+				if useConversationID == "" {
+					// 如果没有新 ID，则尝试从 Redis 获取
+					cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+					useConversationID, _ = redis.Rdb.Get(context.Background(), cacheKey).Result()
+				}
+
+				if useConversationID != "" && chatID != "" {
+					// 使用 chat_id 调用 GetMessageList API，带重试机制（最多重试3次）
+					l.Logger.Info(fmt.Sprintf("使用 Chat ID: %s 和 Conversation ID: %s 获取消息", chatID, useConversationID))
+					var msgResp *coze.MessageListResponse
+					for i := 0; i < 3; i++ {
+						if i > 0 {
+							l.Logger.Info(fmt.Sprintf("GetMessageListByChatID Retry %d/3 after delay...", i))
+							select {
+							case <-ctx.Done():
+								return
+							case <-time.After(time.Duration(i*500) * time.Millisecond):
+							}
+						}
+
+						msgResp, err = c.API().GetMessageListByChatID(ctx, chatID, useConversationID, request.BotID)
+						if err != nil {
+							l.Logger.Error("GetMessageListByChatID 失败: ", err)
+							continue
+						}
+
+						// 如果成功且返回了消息，直接返回
+						if msgResp.Code == 0 {
+							data, parseErr := msgResp.GetMessageListData()
+							if parseErr == nil && len(data.Items) > 0 {
+								break
+							}
+						}
+
+						// 如果是无效聊天错误，继续重试
+						if msgResp.Code == 4001 {
+							l.Logger.Info("Got invalid chat error, will retry...")
+							continue
+						}
+
+						// 其他错误，直接返回
+						break
+					}
+
+					if err != nil {
+						l.Logger.Error("GetMessageListByChatID 最终失败: ", err)
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:获取消息失败", l.svcCtx.Config)
+						return
+					}
+
+					// 打印完整的响应数据用于调试
+					l.Logger.Info("GetMessageListByChatID 完整响应: ", msgResp)
+
+					// 解析 Data 字段
+					data, err := msgResp.GetMessageListData()
+					if err != nil {
+						l.Logger.Error("GetMessageListByChatID 解析 Data 失败: ", err)
+						l.Logger.Info("GetMessageListByChatID Raw Data: ", msgResp.Data)
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:解析消息失败", l.svcCtx.Config)
+						return
+					}
+
+					l.Logger.Info("GetMessageListByChatID 返回消息数量: ", len(data.Items))
+					for i, msg := range data.Items {
+						l.Logger.Info(fmt.Sprintf("GetMessageListByChatID 消息[%d]: Role=%s, Type=%s, ContentType=%s, Content=%s",
+							i, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent()))
+					}
+
+					// 查找 assistant 的 answer 消息
+					var messageText string
+					// 关键修复：累积所有 type=answer 的消息，而不是只取第一条
+					for _, msg := range data.Items {
+						if msg.Role == "assistant" && msg.Type == "answer" {
+							content := msg.GetTextContent()
+							if content != "" {
+								messageText += content // 累积所有内容
+								l.Logger.Info(fmt.Sprintf("累积 answer 消息: %s", content))
+							}
+						}
+					}
+
+					// 如果没找到，尝试查找所有 assistant 角色的消息
+					if messageText == "" {
+						l.Logger.Info("未找到 type=answer 的消息，尝试查找所有 assistant 消息")
+						for _, msg := range data.Items {
+							if msg.Role == "assistant" {
+								content := msg.GetTextContent()
+								if content != "" {
+									messageText = content
+									l.Logger.Info(fmt.Sprintf("找到 assistant 消息: Type=%s, ContentType=%s", msg.Type, msg.ContentType))
+									break
+								}
+							}
+						}
+					}
+
+					if messageText != "" {
+						l.Logger.Info("从 GetMessageListByChatID 获取到消息: ", messageText)
+						go sendToUser(req.OpenKfID, req.CustomerID, messageText+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
+
+						// 将对话记录存储到数据库
+						table := l.svcCtx.ChatModel.Chat
+						_ = table.WithContext(context.Background()).Create(&model.Chat{
+							User:       req.CustomerID,
+							OpenKfID:   req.OpenKfID,
+							MessageID:  req.MsgID,
+							ReqContent: req.Msg,
+							ResContent: messageText,
+						})
+					} else {
+						l.Logger.Error("GetMessageListByChatID 未找到有效消息")
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:Coze未返回有效回复，请稍后重试", l.svcCtx.Config)
+					}
+				} else {
+					l.Logger.Error(fmt.Sprintf("未找到会话 ID 或 Chat ID - ConversationID: %s, ChatID: %s", useConversationID, chatID))
+					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:会话信息丢失，请重新开始对话", l.svcCtx.Config)
+				}
+			} else {
+				l.Logger.Info("coze V3 处理 非流式响应")
+				// 非流式响应
+				resp, err := c.API().ChatMessages(ctx, request)
+				if err != nil {
+					errInfo := err.Error()
+					l.Logger.Error("coze V3 非流式响应错误: ", errInfo)
+					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
+					return
+				}
+
+				l.Logger.Info("coze V3 非流式响应原始数据: ", resp)
+
+				// V3 API 响应中不再直接包含消息内容，需要通过 GetMessageList 获取
+				var messageText string
+				if resp.Code == 0 && resp.Data.Status == "completed" {
+					l.Logger.Info("Coze V3 响应状态: ", resp.Data.Status)
+
+					// 保存 conversation_id 到 redis
+					if resp.Data.ConversationID != "" {
+						// 关键修复：只有当请求中没有传入 conversation_id 时，才保存新的会话 ID
+						if request.ConversationID == "" {
+							// 首次对话，保存新创建的会话 ID
+							l.Logger.Info("Coze V3 非流式响应创建新会话 ID: ", resp.Data.ConversationID)
+							cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+							err := redis.Rdb.Set(context.Background(), cacheKey, resp.Data.ConversationID, 24*time.Hour).Err()
+							if err != nil {
+								l.Logger.Error("Coze 保存会话 ID 到 Redis 失败: ", err)
+							} else {
+								l.Logger.Info("Coze 会话 ID 已保存到 Redis")
+							}
+						} else if resp.Data.ConversationID != request.ConversationID {
+							// 传入了会话 ID，但 Coze 返回了不同的 ID - 这是正常现象，不要覆盖
+							l.Logger.Info(fmt.Sprintf("ℹ️ Coze V3 非流式响应返回的会话 ID 与请求不同（忽略）- 请求: %s, 响应: %s",
+								request.ConversationID, resp.Data.ConversationID))
+							l.Logger.Info("继续使用原会话 ID: ", request.ConversationID)
+						} else {
+							// 返回的 ID 与请求一致，无需操作
+							l.Logger.Debug("Coze V3 非流式响应返回会话 ID (与请求一致): ", resp.Data.ConversationID)
+						}
+
+						// 调用 GetMessageList API 获取实际消息内容
+						msgResp, err := c.API().GetMessageList(ctx, resp.Data.ConversationID, request.BotID)
+						if err != nil {
+							l.Logger.Error("GetMessageList 失败: ", err)
+							sendToUser(req.OpenKfID, req.CustomerID, "系统错误:获取消息失败", l.svcCtx.Config)
+							return
+						}
+
+						// 打印完整的响应数据用于调试
+						l.Logger.Info("GetMessageList 完整响应: ", msgResp)
+
+						// 解析 Data 字段
+						data, err := msgResp.GetMessageListData()
+						if err != nil {
+							l.Logger.Error("GetMessageList 解析 Data 失败: ", err)
+							l.Logger.Info("GetMessageList Raw Data: ", msgResp.Data)
+							sendToUser(req.OpenKfID, req.CustomerID, "系统错误:解析消息失败", l.svcCtx.Config)
+							return
+						}
+
+						l.Logger.Info("GetMessageList 返回消息数量: ", len(data.Items))
+						for i, msg := range data.Items {
+							l.Logger.Info(fmt.Sprintf("GetMessageList 消息[%d]: Role=%s, Type=%s, ContentType=%s, Content=%s",
+								i, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent()))
+						}
+
+						// 查找 assistant 的 answer 消息
+						// 首先尝试查找 type=answer 的消息
+						for _, msg := range data.Items {
+							if msg.Role == "assistant" && msg.Type == "answer" {
+								content := msg.GetTextContent()
+								if content != "" {
+									messageText = content
+									l.Logger.Info("找到 type=answer 的消息")
+									break
+								}
+							}
+						}
+
+						// 如果没找到，尝试查找所有 assistant 角色的消息
+						if messageText == "" {
+							l.Logger.Info("未找到 type=answer 的消息，尝试查找所有 assistant 消息")
+							for _, msg := range data.Items {
+								if msg.Role == "assistant" {
+									content := msg.GetTextContent()
+									if content != "" {
+										messageText = content
+										l.Logger.Info(fmt.Sprintf("找到 assistant 消息: Type=%s, ContentType=%s", msg.Type, msg.ContentType))
+										break
+									}
+								}
+							}
+						}
+
+						if messageText == "" {
+							l.Logger.Error("GetMessageList 未找到有效消息")
+							sendToUser(req.OpenKfID, req.CustomerID, "系统错误:未收到Coze响应", l.svcCtx.Config)
+							return
+						}
+
+						l.Logger.Info("从 GetMessageList 获取到消息: ", messageText)
+					} else {
+						l.Logger.Error("Coze V3 响应未返回会话 ID")
+						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:未收到Coze响应", l.svcCtx.Config)
+						return
+					}
+				} else {
+					l.Logger.Error("Coze V3 响应失败: Code=", resp.Code, ", Status=", resp.Data.Status)
+					if resp.Data.LastError.Code != 0 {
+						l.Logger.Error("错误详情: Code=", resp.Data.LastError.Code, ", Msg=", resp.Data.LastError.Msg)
+					}
+					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:Coze处理失败", l.svcCtx.Config)
+					return
+				}
+
+				// 把数据发给微信用户
+				go sendToUser(req.OpenKfID, req.CustomerID, messageText, l.svcCtx.Config)
+
+				// 再去插入数据
+				table := l.svcCtx.ChatModel.Chat
+				_ = table.WithContext(context.Background()).Create(&model.Chat{
+					User:       req.CustomerID,
+					OpenKfID:   req.OpenKfID,
+					MessageID:  req.MsgID,
+					ReqContent: req.Msg,
+					ResContent: messageText,
+				})
+				l.Logger.Debug("coze 处理完成: ", messageText)
 			}
 		}()
 
@@ -983,17 +1433,17 @@ type CustomerCommendTransferToHuman struct{}
 func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *types.CustomerChatReq) bool {
 	// 调用企业微信 API 转人工客服
 	// service_state: 0-未处理 1-由AI接待 2-由人工接待 3-已转人工
-	
+
 	// 获取配置的服务状态和接待人员ID
 	serviceState := 2 // 默认值：排队等待接待
 	servicerUserID := ""
-	
+
 	for _, app := range l.svcCtx.Config.WeCom.MultipleApplication {
 		if app.ManageAllKFSession {
 			if app.ServiceState > 0 {
 				serviceState = app.ServiceState
 			}
-			
+
 			// 优先使用 ServicerUserIDs 列表进行轮询分配
 			if len(app.ServicerUserIDs) > 0 {
 				// 使用 Redis 实现轮询分配
@@ -1002,15 +1452,15 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 				if err != nil {
 					currentIndex = 0
 				}
-				
+
 				// 获取当前接待人员
 				servicerUserID = app.ServicerUserIDs[currentIndex%len(app.ServicerUserIDs)]
-				
+
 				// 更新索引到下一个
 				nextIndex := (currentIndex + 1) % len(app.ServicerUserIDs)
 				_ = redis.Rdb.Set(context.Background(), cacheKey, nextIndex, 0).Err()
-				
-				logx.Info("转人工客服-轮询分配", 
+
+				logx.Info("转人工客服-轮询分配",
 					"openKfID:", req.OpenKfID,
 					"totalServicers:", len(app.ServicerUserIDs),
 					"currentIndex:", currentIndex,
@@ -1022,25 +1472,25 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 			break
 		}
 	}
-	
-	logx.Info("转人工客服-配置信息", 
+
+	logx.Info("转人工客服-配置信息",
 		"openKfID:", req.OpenKfID,
 		"customerID:", req.CustomerID,
 		"serviceState:", serviceState,
 		"servicerUserID:", servicerUserID)
-	
+
 	// 如果 serviceState=3，则 servicerUserID 必填
 	if serviceState == 3 && servicerUserID == "" {
 		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败: 系统未配置默认接待人员，请联系管理员配置", l.svcCtx.Config)
 		return false
 	}
-	
+
 	err := wecom.TransferToHumanServiceState(req.OpenKfID, req.CustomerID, serviceState, servicerUserID)
 	if err != nil {
 		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败:"+err.Error(), l.svcCtx.Config)
 		return false
 	}
-	
+
 	// 根据服务状态返回不同的提示
 	if serviceState == 2 {
 		sendToUser(req.OpenKfID, req.CustomerID, "已为您提交人工客服申请，请在待接入池中等待接待人员接入~", l.svcCtx.Config)
@@ -1091,6 +1541,195 @@ func (p CustomerCommendImage) customerExec(l *CustomerChatLogic, req *types.Cust
 		return false
 	}
 
+	// 根据配置选择不同的处理方式
+	if l.svcCtx.Config.ModelProvider.Company == "coze" {
+		// 使用 Coze 处理图片
+		return p.handleImageForCoze(l, req, msg)
+	} else {
+		// 使用 Gemini 处理图片（原有逻辑）
+		return p.handleImageForGemini(l, req, msg)
+	}
+}
+
+// handleImageForCoze 处理 Coze 模式的图片上传
+func (p CustomerCommendImage) handleImageForCoze(l *CustomerChatLogic, req *types.CustomerChatReq, imageURL string) bool {
+	l.Logger.Info("Coze 模式：开始处理图片 ", imageURL)
+
+	// 创建 Coze 客户端
+	c := coze.NewClient(l.svcCtx.Config.Coze.Host, l.svcCtx.Config.Coze.Key)
+
+	// 上传图片到 Coze 获取 file_id
+	sendToUser(req.OpenKfID, req.CustomerID, "图片正在识别，请稍等~", l.svcCtx.Config)
+
+	ctx := context.Background()
+	fileID, err := c.API().UploadFileFromURL(ctx, imageURL)
+	if err != nil {
+		sendToUser(req.OpenKfID, req.CustomerID, "图片上传失败: "+err.Error(), l.svcCtx.Config)
+		return false
+	}
+
+	l.Logger.Info("Coze 图片上传成功, file_id: ", fileID)
+
+	// 将 file_id 存储到 Redis，供后续 Coze 请求使用
+	cacheKey := fmt.Sprintf("coze:image:%s:%s", req.OpenKfID, req.CustomerID)
+	err = redis.Rdb.Set(context.Background(), cacheKey, fileID, 10*time.Minute).Err()
+	if err != nil {
+		l.Logger.Error("保存 file_id 到 Redis 失败: ", err)
+	}
+
+	// 直接调用 Coze API 发送图片消息
+	return p.sendImageToCoze(l, req, fileID)
+}
+
+// sendImageToCoze 发送图片消息到 Coze
+func (p CustomerCommendImage) sendImageToCoze(l *CustomerChatLogic, req *types.CustomerChatReq, fileID string) bool {
+	c := coze.NewClient(l.svcCtx.Config.Coze.Host, l.svcCtx.Config.Coze.Key)
+
+	// 从 redis 中获取会话 ID
+	cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+	conversationId, err := redis.Rdb.Get(context.Background(), cacheKey).Result()
+	if err != nil {
+		l.Logger.Info("Coze 首次对话，无历史会话 ID")
+	} else {
+		l.Logger.Info("Coze 从 Redis 获取到会话 ID: ", conversationId)
+	}
+
+	// 构造 object_string 类型的消息，包含图片
+	// Coze V3 API 的 object_string 格式为 JSON 数组
+	objectStringContent := fmt.Sprintf(`[{"type":"image","file_id":"%s"}]`, fileID)
+
+	autoSaveHistory := true
+	request := &coze.ChatMessageRequest{
+		BotID: l.svcCtx.Config.Coze.BotID,
+		User:  req.CustomerID,
+		Messages: []coze.ChatMessage{
+			{
+				Role:        "user",
+				Content:     objectStringContent,
+				ContentType: "object_string",
+				Type:        "question",
+			},
+		},
+		AutoSaveHistory: &autoSaveHistory,
+	}
+
+	if conversationId != "" {
+		request.ConversationID = conversationId
+	}
+
+	l.Logger.Info("Coze 发送图片消息 - BotID: ", request.BotID, ", ConversationID: ", request.ConversationID)
+	l.Logger.Info("图片 file_id: ", fileID)
+
+	// 使用流式响应获取 Coze 的回答
+	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(ctx, 200*time.Second)
+	defer cancel()
+
+	streamChannel, err := c.API().ChatMessagesStream(ctx, request)
+	if err != nil {
+		sendToUser(req.OpenKfID, req.CustomerID, "系统错误: "+err.Error(), l.svcCtx.Config)
+		return false
+	}
+
+	var (
+		messageText string
+		rs          []rune
+	)
+
+	// 处理流式响应
+	for response := range streamChannel {
+		if response.Err != nil {
+			errInfo := response.Err.Error()
+			l.Logger.Error("coze V3 流式响应错误: ", errInfo)
+			sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
+			return false
+		}
+
+		// 打印所有事件的详细信息用于调试
+		l.Logger.Info(fmt.Sprintf("Coze 图片响应 - Event: '%s', Status: '%s'", response.Event, response.Status))
+
+		// 关键修复：Coze V3 API 将消息内容直接放在根级别，而不是 data 字段中
+		// 优先从根级别提取，如果为空再从 Data 中提取
+		var role, msgType, content string
+
+		// 情况1：从根级别提取（Coze V3 的主要方式）
+		if response.Role != "" {
+			role = response.Role
+			msgType = response.Type
+			content = response.Content
+			l.Logger.Info(fmt.Sprintf("  Root - Role: '%s', Type: '%s', ContentType: '%s', Content Length: %d",
+				response.Role, response.Type, response.ContentType, len(response.Content)))
+			if len(response.Content) < 200 {
+				l.Logger.Info(fmt.Sprintf("  Content: '%s'", response.Content))
+			}
+		} else if response.Data != nil {
+			// 情况2：从 Data 字段提取（某些事件类型）
+			role = response.Data.Role
+			msgType = response.Data.Type
+			content = response.Data.Content
+			l.Logger.Info(fmt.Sprintf("  Data - Role: '%s', Type: '%s', ContentType: '%s', Content Length: %d",
+				response.Data.Role, response.Data.Type, response.Data.ContentType, len(response.Data.Content)))
+			if len(response.Data.Content) < 200 {
+				l.Logger.Info(fmt.Sprintf("  Content: '%s'", response.Data.Content))
+			}
+		} else {
+			l.Logger.Info("  无消息内容")
+		}
+
+		// 保存 conversation_id
+		if response.ConversationID != "" {
+			if request.ConversationID == "" {
+				cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
+				err := redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
+				if err != nil {
+					l.Logger.Error("Coze 保存会话 ID 到 Redis 失败: ", err)
+				}
+			}
+		}
+
+		// 保存 chat_id（用于调试）
+		if response.ChatID != "" {
+			l.Logger.Info("Coze Chat ID: ", response.ChatID)
+		}
+
+		// 累积回答文本
+		if role == "assistant" && content != "" {
+			l.Logger.Info(fmt.Sprintf("收到 assistant 消息 - ID: '%s', Type: '%s', Event: '%s', Content Length: %d",
+				response.ID, msgType, response.Event, len(content)))
+			if len(content) < 200 {
+				l.Logger.Info(fmt.Sprintf("  Content: '%s'", content))
+			}
+
+			// 只累积 answer 类型的内容，且只在 delta 事件中累积（避免 completed 事件重复累积）
+			if msgType == "answer" {
+				// 关键修复：跳过 completed 事件，因为它包含完整内容而非增量
+				if response.Event == "conversation.message.completed" {
+					l.Logger.Info(fmt.Sprintf("跳过 completed 事件（包含完整内容，无需累积）- ID: '%s'", response.ID))
+					continue
+				}
+
+				// 对于 delta 事件，直接累积（不使用 ID 去重，因为所有 delta 事件 ID 相同是正常的）
+				rs = append(rs, []rune(content)...)
+				messageText = string(rs)
+				l.Logger.Info(fmt.Sprintf("累积回答 - 当前长度: %d", len(messageText)))
+			}
+		}
+	}
+
+	// 发送回复给用户
+	if messageText != "" {
+		sendToUser(req.OpenKfID, req.CustomerID, messageText, l.svcCtx.Config)
+		l.Logger.Info("Coze 图片消息处理完成，回复长度: ", len(messageText))
+	} else {
+		l.Logger.Error("Coze 未返回任何回复内容")
+		sendToUser(req.OpenKfID, req.CustomerID, "图片识别失败，请重试", l.svcCtx.Config)
+	}
+
+	return false // 不再继续处理
+}
+
+// handleImageForGemini 处理 Gemini 模式的图片识别（原有逻辑）
+func (p CustomerCommendImage) handleImageForGemini(l *CustomerChatLogic, req *types.CustomerChatReq, imageURL string) bool {
 	// 中间思路，请求进行图片识别
 	c := gemini.NewChatClient(l.svcCtx.Config.Gemini.Key).WithHost(l.svcCtx.Config.Gemini.Host).
 		WithTemperature(l.svcCtx.Config.Gemini.Temperature).WithModel(gemini.VisionModel)
@@ -1101,7 +1740,7 @@ func (p CustomerCommendImage) customerExec(l *CustomerChatLogic, req *types.Cust
 	}
 	var parseImage []gemini.ChatModelMessage
 	// 将 图片 转成 base64
-	base64Data, mime, err := gemini.GetImageContent(msg)
+	base64Data, mime, err := gemini.GetImageContent(imageURL)
 	if err != nil {
 		sendToUser(req.OpenKfID, req.CustomerID, "图片解析失败:"+err.Error(), l.svcCtx.Config)
 		return false

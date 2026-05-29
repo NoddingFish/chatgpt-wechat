@@ -1,6 +1,6 @@
 module chat
 
-go 1.24.1
+go 1.23
 
 require (
 	github.com/disintegration/imaging v1.6.2

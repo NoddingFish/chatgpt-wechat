@@ -1,4 +1,4 @@
-FROM golang:1.24.1-alpine AS builder
+FROM golang:alpine AS builder
 
 # 为镜像设置必要的环境变量
 ENV GO111MODULE=on \
@@ -27,6 +27,9 @@ RUN go mod download
 
 # 将代码复制到容器中
 COPY . .
+
+# 在复制完整代码后执行 go mod tidy，确保依赖正确
+RUN go mod tidy
 
 # 将代码编译成二进制可执行文件 app
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o app ./service/chat/api/chat.go

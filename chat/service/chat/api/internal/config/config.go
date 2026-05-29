@@ -32,10 +32,10 @@ type Config struct {
 		MultipleApplication []struct {
 			AgentID            int64
 			AgentSecret        string
-			ManageAllKFSession bool   `json:",optional,default=false"`
-			Model              string `json:",optional,default=gpt-3.5-turbo"`
-			BasePrompt         string `json:",optional,default=你是ChatGPT，一个由OpenAI训练的大型语言模型，你旨在回答并解决人们的任何问题，并且可以使用多种语言与人交流。"`
-			Welcome            string `json:",optional,default=您好！我是ChatGPT，一个由OpenAI训练的大型语言模型，我可以回答您的问题和进行交流。请告诉我您需要了解些什么，我会尽力为您提供答案。\n\n发送#help查看更多功能"`
+			ManageAllKFSession bool     `json:",optional,default=false"`
+			Model              string   `json:",optional,default=gpt-3.5-turbo"`
+			BasePrompt         string   `json:",optional,default=你是ChatGPT，一个由OpenAI训练的大型语言模型，你旨在回答并解决人们的任何问题，并且可以使用多种语言与人交流。"`
+			Welcome            string   `json:",optional,default=您好！我是ChatGPT，一个由OpenAI训练的大型语言模型，我可以回答您的问题和进行交流。请告诉我您需要了解些什么，我会尽力为您提供答案。\n\n发送#help查看更多功能"`
 			ServicerUserID     string   `json:",optional,default="`  // 接待人员userid，转人工时使用（单个，保留兼容）
 			ServicerUserIDs    []string `json:",optional"`           // 接待人员userid列表，转人工时轮询使用
 			ServiceState       int      `json:",optional,default=2"` // 转人工时的服务状态：2-排队等待接待 3-直接指定接待人员
@@ -168,5 +168,12 @@ type Config struct {
 		Temperature float32 `json:",optional,default=1.0"`
 		EnableProxy bool    `json:",optional,default=false"`
 		Debug       bool    `json:",optional,default=false"`
+	}
+
+	// Coze 配置
+	Coze struct {
+		Key   string `json:",optional"`
+		Host  string `json:",optional,default=https://api.coze.cn"`
+		BotID string `json:",optional"`
 	}
 }

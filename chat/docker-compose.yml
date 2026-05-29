@@ -15,6 +15,11 @@ services:
     restart: always
     networks:
       - chat_network
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_started
   websocket:
     container_name: chat-websocket
     build:
@@ -26,6 +31,11 @@ services:
     restart: always
     networks:
       - chat_network
+    depends_on:
+      pgvector:
+        condition: service_healthy
+      redis:
+        condition: service_started
   redis:
     container_name: redis7
     image: redis:7.0
@@ -77,5 +87,10 @@ services:
     networks:
       - chat_network
     restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U chat -d chat"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 networks:
   chat_network:
