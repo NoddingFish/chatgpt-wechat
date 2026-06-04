@@ -867,18 +867,18 @@ func TransferToHumanServiceState(openKfID, externalUserID string, serviceState i
 		logx.Info("客服消息-获取 app 失败")
 		return fmt.Errorf("获取客服应用失败")
 	}
-	
+
 	// 当 serviceState=3 时，servicerUserID 为必填
 	if serviceState == 3 && servicerUserID == "" {
 		logx.Error("转人工客服-servicer_userid不能为空")
 		return fmt.Errorf("转人工客服失败: 接待人员userid不能为空")
 	}
-	
+
 	token := app.GetAccessToken()
-	
+
 	// 请求地址: https://qyapi.weixin.qq.com/cgi-bin/kf/service_state/trans?access_token=ACCESS_TOKEN
 	url := fmt.Sprintf("%s/cgi-bin/kf/service_state/trans?access_token=%s", WeCom.QYAPIHost, token)
-	
+
 	// 构造请求体
 	type ServiceStateReq struct {
 		OpenKfid       string `json:"open_kfid"`
@@ -886,30 +886,30 @@ func TransferToHumanServiceState(openKfID, externalUserID string, serviceState i
 		ServiceState   int    `json:"service_state"`
 		ServicerUserID string `json:"servicer_userid,omitempty"`
 	}
-	
+
 	reqBody := ServiceStateReq{
 		OpenKfid:       openKfID,
 		ExternalUserid: externalUserID,
 		ServiceState:   serviceState,
 		ServicerUserID: servicerUserID,
 	}
-	
+
 	// 打印请求参数用于调试
-	logx.Info("转人工客服-请求参数", 
+	logx.Info("转人工客服-请求参数",
 		"url:", url,
 		"openKfID:", openKfID,
 		"externalUserID:", externalUserID,
 		"serviceState:", serviceState,
 		"servicerUserID:", servicerUserID)
-	
+
 	b, err := json.Marshal(reqBody)
 	if err != nil {
 		logx.Error("转人工客服-请求参数json构造错误", err.Error())
 		return err
 	}
-	
+
 	logx.Info("转人工客服-请求JSON", string(b))
-	
+
 	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
 	if err != nil {
 		logx.Error("转人工客服-请求错误", err.Error())
@@ -918,37 +918,202 @@ func TransferToHumanServiceState(openKfID, externalUserID string, serviceState i
 	defer func() {
 		_ = resp.Body.Close()
 	}()
-	
+
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		logx.Error("转人工客服-响应读取错误", err.Error())
 		return err
 	}
-	
+
 	// 打印响应内容用于调试
 	logx.Info("转人工客服-响应内容", string(body))
-	
+
 	// 解析响应
 	type ServiceStateResp struct {
 		Errcode int    `json:"errcode"`
 		Errmsg  string `json:"errmsg"`
 	}
-	
+
 	var result ServiceStateResp
 	err = json.Unmarshal(body, &result)
 	if err != nil {
 		logx.Error("转人工客服-响应解析错误", err.Error())
 		return err
 	}
-	
+
 	if result.Errcode != 0 {
-		logx.Error("转人工客服-API返回错误", 
-			"errcode:", result.Errcode, 
+		logx.Error("转人工客服-API返回错误",
+			"errcode:", result.Errcode,
 			"errmsg:", result.Errmsg,
 			"servicerUserID:", servicerUserID)
 		return fmt.Errorf("转人工客服失败: %s (错误码: %d)", result.Errmsg, result.Errcode)
 	}
-	
+
 	logx.Info("转人工客服-成功", "openKfID:", openKfID, "externalUserID:", externalUserID, "servicerUserID:", servicerUserID)
 	return nil
+}
+
+// SendWebhookNotification 发送企业微信 webhook 通知
+func SendWebhookNotification(webhookURL, message string) error {
+	if webhookURL == "" {
+		logx.Error("webhook URL 为空")
+		return fmt.Errorf("webhook URL 不能为空")
+	}
+
+	// 构造 webhook 消息体
+	type WebhookMsg struct {
+		MsgType string `json:"msgtype"`
+		Text    struct {
+			Content string `json:"content"`
+		} `json:"text"`
+	}
+
+	msg := WebhookMsg{
+		MsgType: "text",
+	}
+	msg.Text.Content = message
+
+	b, err := json.Marshal(msg)
+	if err != nil {
+		logx.Error("webhook 消息 JSON 序列化失败", err.Error())
+		return err
+	}
+
+	logx.Info("发送 webhook 通知 - URL:", webhookURL, "消息:", message)
+
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(b))
+	if err != nil {
+		logx.Error("webhook 请求失败", err.Error())
+		return err
+	}
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logx.Error("webhook 响应读取失败", err.Error())
+		return err
+	}
+
+	// 解析响应
+	type WebhookResp struct {
+		Errcode int    `json:"errcode"`
+		Errmsg  string `json:"errmsg"`
+	}
+
+	var result WebhookResp
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		logx.Error("webhook 响应解析失败", err.Error())
+		return err
+	}
+
+	if result.Errcode != 0 {
+		logx.Error("webhook 发送失败", "errcode:", result.Errcode, "errmsg:", result.Errmsg)
+		return fmt.Errorf("webhook 发送失败: %s (错误码: %d)", result.Errmsg, result.Errcode)
+	}
+
+	logx.Info("webhook 通知发送成功")
+	return nil
+}
+
+// SendCustomerChatMessageSync 同步发送客服消息（用于转人工等关键场景）
+func SendCustomerChatMessageSync(openKfID, customerID, msg string, files ...string) error {
+	// 然后把数据 发给微信用户
+	app, ok := getCustomerApp()
+	if !ok {
+		logx.Info("客服消息-获取 app 失败")
+		return fmt.Errorf("获取客服应用失败")
+	}
+
+	recipient := workwx.Recipient{
+		UserIDs:  []string{customerID},
+		OpenKfID: openKfID,
+	}
+	rs := []rune(msg)
+
+	//当 msg 大于 850 个字符 的时候切割发送，避免被企业微信吞掉
+	if len(rs) > 850 {
+		messages := splitMsg(rs, 850)
+		for _, message := range messages {
+			err := app.SendTextMessage(&recipient, message, false)
+			if err != nil {
+				fmt.Println("客服消息-发送失败 err:", err)
+				return err
+			}
+		}
+		return nil
+	}
+
+	err := app.SendTextMessage(&recipient, msg, false)
+	if err != nil {
+		fmt.Println("客服消息-发送失败 err:", err)
+		return err
+	}
+	return nil
+}
+
+// GetKFServiceState 获取客服会话状态
+// service_state: 0-未处理 1-由智能助手接待 2-待接入池排队中 3-由人工接待 4-已结束/未开始
+func GetKFServiceState(openKfID, customerID string) (int, error) {
+	app, ok := getCustomerApp()
+	if !ok {
+		logx.Error("客服消息-获取 app 失败")
+		return -1, fmt.Errorf("获取客服应用失败")
+	}
+
+	// 获取 access token
+	accessToken := app.GetAccessToken()
+
+	// 调用企业微信 API 获取会话状态
+	url := fmt.Sprintf("%s/cgi-bin/kf/service_state/get?access_token=%s", WeCom.QYAPIHost, accessToken)
+
+	requestBody := map[string]string{
+		"open_kfid":       openKfID,
+		"external_userid": customerID,
+	}
+
+	jsonData, err := json.Marshal(requestBody)
+	if err != nil {
+		logx.Error("获取会话状态-请求参数构造失败:", err)
+		return -1, err
+	}
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer(jsonData))
+	if err != nil {
+		logx.Error("获取会话状态-请求失败:", err)
+		return -1, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		logx.Error("获取会话状态-响应读取失败:", err)
+		return -1, err
+	}
+
+	// 解析响应
+	var result struct {
+		Errcode        int    `json:"errcode"`
+		Errmsg         string `json:"errmsg"`
+		ServiceState   int    `json:"service_state"`
+		ServicerUserID string `json:"servicer_userid"`
+	}
+
+	err = json.Unmarshal(body, &result)
+	if err != nil {
+		logx.Error("获取会话状态-响应解析失败:", err)
+		return -1, err
+	}
+
+	if result.Errcode != 0 {
+		logx.Error(fmt.Sprintf("获取会话状态-API错误: errcode=%d, errmsg=%s", result.Errcode, result.Errmsg))
+		return -1, fmt.Errorf("API错误: %s", result.Errmsg)
+	}
+
+	logx.Info(fmt.Sprintf("获取会话状态成功: openKfID=%s, customerID=%s, service_state=%d",
+		openKfID, customerID, result.ServiceState))
+
+	return result.ServiceState, nil
 }

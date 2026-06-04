@@ -299,6 +299,36 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 		fmt.Println("=========================================\n")
 
 		go func() {
+			// 【关键修复】在开始处理之前，先检查是否已转人工
+			cacheKey := fmt.Sprintf("chat:transfered:%s:%s", req.OpenKfID, req.CustomerID)
+			transfered, _ := redis.Rdb.Get(context.Background(), cacheKey).Bool()
+			if transfered {
+				l.Logger.Info("检测到转人标志，检查企业微信会话状态")
+
+				// 查询企业微信客服会话状态
+				serviceState, err := wecom.GetKFServiceState(req.OpenKfID, req.CustomerID)
+				if err != nil {
+					l.Logger.Error("获取会话状态失败，保守处理：放弃调用 Coze API", err)
+					return
+				}
+
+				// service_state: 0-未处理 1-由智能助手接待 2-待接入池排队中 3-由人工接待 4-已结束/未开始
+				if serviceState == 0 || serviceState == 1 || serviceState == 4 {
+					// 会话未处理、由智能助手接待或已结束，清除转人标志，恢复AI服务
+					_ = redis.Rdb.Del(context.Background(), cacheKey).Err()
+					l.Logger.Info(fmt.Sprintf("会话状态为%d(未处理/智能助手/已结束)，自动清除转人标志，恢复AI服务", serviceState))
+					// 继续执行，调用 Coze API
+				} else if serviceState == 3 {
+					// 正在由人工接待，不调用 Coze API
+					l.Logger.Info(fmt.Sprintf("会话状态为%d(由人工接待)，放弃调用 Coze API", serviceState))
+					return
+				} else {
+					// service_state == 2 (待接入池排队中)，不调用 Coze API
+					l.Logger.Info(fmt.Sprintf("会话状态为%d(排队中)，放弃调用 Coze API", serviceState))
+					return
+				}
+			}
+
 			ctx := context.Background()
 			// 设置超时时间为 200 秒
 			ctx, cancel := context.WithTimeout(ctx, 200*time.Second)
@@ -538,6 +568,37 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 					if messageText != "" {
 						l.Logger.Info("从 GetMessageListByChatID 获取到消息: ", messageText)
+
+						// 【关键修复】在发送之前检查是否已转人工
+						cacheKey := fmt.Sprintf("chat:transfered:%s:%s", req.OpenKfID, req.CustomerID)
+						transfered, _ := redis.Rdb.Get(context.Background(), cacheKey).Bool()
+						if transfered {
+							l.Logger.Info("检测到转人标志，再次检查企业微信会话状态")
+
+							// 查询企业微信客服会话状态
+							serviceState, err := wecom.GetKFServiceState(req.OpenKfID, req.CustomerID)
+							if err != nil {
+								l.Logger.Error("获取会话状态失败，保守处理：放弃发送Coze回复", err)
+								return
+							}
+
+							// service_state: 0-未处理 1-由智能助手接待 2-待接入池排队中 3-由人工接待 4-已结束/未开始
+							if serviceState == 0 || serviceState == 1 || serviceState == 4 {
+								// 会话未处理、由智能助手接待或已结束，清除转人标志，恢复AI服务
+								_ = redis.Rdb.Del(context.Background(), cacheKey).Err()
+								l.Logger.Info(fmt.Sprintf("会话状态为%d(未处理/智能助手/已结束)，自动清除转人标志，继续发送Coze回复", serviceState))
+								// 继续执行，发送消息
+							} else if serviceState == 3 {
+								// 正在由人工接待，不发送 Coze 回复
+								l.Logger.Info(fmt.Sprintf("会话状态为%d(由人工接待)，放弃发送Coze回复", serviceState))
+								return
+							} else {
+								// service_state == 2 (待接入池排队中)，不发送 Coze 回复
+								l.Logger.Info(fmt.Sprintf("会话状态为%d(排队中)，放弃发送Coze回复", serviceState))
+								return
+							}
+						}
+
 						go sendToUser(req.OpenKfID, req.CustomerID, messageText+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
 
 						// 将对话记录存储到数据库
@@ -1278,6 +1339,7 @@ func (l *CustomerChatLogic) FactoryCommend(req *types.CustomerChatReq) (proceed 
 	template["#about"] = CustomerCommendAbout{}
 	template["#plugin"] = CustomerPlugin{}
 	template["#image"] = CustomerCommendImage{}
+	template["#resume"] = CustomerCommendResume{}
 
 	for s, data := range template {
 		if strings.HasPrefix(req.Msg, s) {
@@ -1406,6 +1468,7 @@ func (p CustomerCommendHelp) customerExec(l *CustomerChatLogic, req *types.Custo
 		"基础模块🕹️\n\n#help       查看所有指令",
 		"#system 查看会话系统信息",
 		"#clear 清空当前会话的数据",
+		"#resume 恢复AI客服服务（转人工后可用）",
 		"\n插件🛒\n",
 		"#plugin:list 查看所有插件",
 	)
@@ -1425,6 +1488,23 @@ type CustomerCommendDirect struct{}
 func (p CustomerCommendDirect) customerExec(l *CustomerChatLogic, req *types.CustomerChatReq) bool {
 	msg := strings.Replace(req.Msg, "#direct:", "", -1)
 	sendToUser(req.OpenKfID, req.CustomerID, msg, l.svcCtx.Config)
+	return false
+}
+
+// CustomerCommendResume 恢复AI客服服务
+type CustomerCommendResume struct{}
+
+func (p CustomerCommendResume) customerExec(l *CustomerChatLogic, req *types.CustomerChatReq) bool {
+	// 清除转人标志，恢复AI服务
+	cacheKey := fmt.Sprintf("chat:transfered:%s:%s", req.OpenKfID, req.CustomerID)
+	err := redis.Rdb.Del(context.Background(), cacheKey).Err()
+	if err != nil {
+		l.Logger.Error("清除转人标志失败: ", err)
+		sendToUser(req.OpenKfID, req.CustomerID, "系统错误:恢复AI服务失败", l.svcCtx.Config)
+		return false
+	}
+
+	sendToUser(req.OpenKfID, req.CustomerID, "✅ AI客服服务已恢复\n\n您现在可以继续与智能助手对话了。", l.svcCtx.Config)
 	return false
 }
 
@@ -1485,18 +1565,57 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 		return false
 	}
 
+	// 【关键修复】在调用转人工接口之前先发送提示消息给用户
+	// 原因：转人工后会话状态变更，再发送消息会失败（错误码95018）
+	logx.Info("转人工客服-准备发送通知消息",
+		"openKfID:", req.OpenKfID,
+		"customerID:", req.CustomerID,
+		"serviceState:", serviceState)
+
+	// 【重要】使用同步发送，确保消息发送成功后再继续执行转人工操作
+	var sendErr error
+	if serviceState == 2 {
+		logx.Info("转人工客服-发送排队消息")
+		sendErr = wecom.SendCustomerChatMessageSync(req.OpenKfID, req.CustomerID, "已转人工，正在排队中，请耐心等待")
+	} else {
+		logx.Info("转人工客服-发送转接消息")
+		sendErr = wecom.SendCustomerChatMessageSync(req.OpenKfID, req.CustomerID, "已转人工，正在排队中，请耐心等待")
+	}
+
+	if sendErr != nil {
+		logx.Error("转人工客服-发送提示消息失败", sendErr)
+		// 即使发送失败，也继续执行转人工操作
+	}
+
+	// 【关键修复】设置转人标志,阻止Coze的goroutine继续发送消息
+	// 过期时间设置为3分钟，避免长时间阻塞AI服务
+	cacheKey := fmt.Sprintf("chat:transfered:%s:%s", req.OpenKfID, req.CustomerID)
+	_ = redis.Rdb.Set(context.Background(), cacheKey, true, 3*time.Minute).Err()
+	logx.Info("转人工客服-已设置转人标志(3分钟后自动失效)")
+
+	// 调用企业微信转人工接口
 	err := wecom.TransferToHumanServiceState(req.OpenKfID, req.CustomerID, serviceState, servicerUserID)
 	if err != nil {
 		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败:"+err.Error(), l.svcCtx.Config)
 		return false
 	}
 
-	// 根据服务状态返回不同的提示
-	if serviceState == 2 {
-		sendToUser(req.OpenKfID, req.CustomerID, "已为您提交人工客服申请，请在待接入池中等待接待人员接入~", l.svcCtx.Config)
-	} else {
-		sendToUser(req.OpenKfID, req.CustomerID, "已为您转接人工客服，请耐心等待~", l.svcCtx.Config)
+	// 发送 webhook 通知
+	if l.svcCtx.Config.Webhook.TransferToHumanURL != "" {
+		// 提取客户 ID 尾号作为标识（最后4位）
+		customerTail := req.CustomerID
+		if len(req.CustomerID) > 4 {
+			customerTail = req.CustomerID[len(req.CustomerID)-4:]
+		}
+		webhookMsg := fmt.Sprintf("有客户(尾号:%s)发起人工接入请求，请尽快处理。", customerTail)
+		go func() {
+			err := wecom.SendWebhookNotification(l.svcCtx.Config.Webhook.TransferToHumanURL, webhookMsg)
+			if err != nil {
+				l.Logger.Error("webhook 通知发送失败: ", err.Error())
+			}
+		}()
 	}
+
 	return false
 }
 

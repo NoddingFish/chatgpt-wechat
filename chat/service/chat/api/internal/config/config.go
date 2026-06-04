@@ -176,4 +176,9 @@ type Config struct {
 		Host  string `json:",optional,default=https://api.coze.cn"`
 		BotID string `json:",optional"`
 	}
+
+	// Webhook 通知配置
+	Webhook struct {
+		TransferToHumanURL string `json:",optional,default="` // 转人工 webhook 地址
+	} `json:",optional"`
 }
