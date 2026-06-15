@@ -1565,6 +1565,25 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 		return false
 	}
 
+	// 【新增】检查是否在工作时间内
+	if l.svcCtx.Config.HumanService.Enable {
+		inWorkingHours := wecom.IsInWorkingHours(l.svcCtx.Config.HumanService.StartTime, l.svcCtx.Config.HumanService.EndTime)
+		if !inWorkingHours {
+			logx.Info("转人工客服-当前不在工作时间内",
+				"currentTime:", time.Now().Format("15:04"),
+				"startTime:", l.svcCtx.Config.HumanService.StartTime,
+				"endTime:", l.svcCtx.Config.HumanService.EndTime)
+
+			// 发送下班时间提示消息
+			offlineMessage := l.svcCtx.Config.HumanService.OfflineMessage
+			if offlineMessage == "" {
+				offlineMessage = "现已超出人工服务时段，无法转接人工，建议使用智能客服处理，人工咨询请上午 9 点后访问。\n\n人工服务时间：09:00-17:00（北京时间）"
+			}
+			sendToUser(req.OpenKfID, req.CustomerID, offlineMessage, l.svcCtx.Config)
+			return false
+		}
+	}
+
 	// 【关键修复】在调用转人工接口之前先发送提示消息给用户
 	// 原因：转人工后会话状态变更，再发送消息会失败（错误码95018）
 	logx.Info("转人工客服-准备发送通知消息",

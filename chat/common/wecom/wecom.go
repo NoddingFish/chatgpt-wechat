@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -951,6 +952,52 @@ func TransferToHumanServiceState(openKfID, externalUserID string, serviceState i
 
 	logx.Info("转人工客服-成功", "openKfID:", openKfID, "externalUserID:", externalUserID, "servicerUserID:", servicerUserID)
 	return nil
+}
+
+// IsInWorkingHours 检查当前时间是否在工作时间内
+// startTime: 工作开始时间，格式 "09:00"
+// endTime: 工作结束时间，格式 "17:00"
+// 返回 true 表示在工作时间内，false 表示不在工作时间内
+func IsInWorkingHours(startTime, endTime string) bool {
+	// 获取当前北京时间
+	now := time.Now().UTC()
+	// 转换为北京时间 (UTC+8)
+	beijingTime := now.Add(8 * time.Hour)
+
+	// 解析开始时间和结束时间
+	startParts := strings.Split(startTime, ":")
+	endParts := strings.Split(endTime, ":")
+
+	if len(startParts) != 2 || len(endParts) != 2 {
+		logx.Error("工作时间格式错误", "startTime:", startTime, "endTime:", endTime)
+		return false
+	}
+
+	startHour, err1 := strconv.Atoi(startParts[0])
+	startMin, err2 := strconv.Atoi(startParts[1])
+	endHour, err3 := strconv.Atoi(endParts[0])
+	endMin, err4 := strconv.Atoi(endParts[1])
+
+	if err1 != nil || err2 != nil || err3 != nil || err4 != nil {
+		logx.Error("工作时间解析错误", err1, err2, err3, err4)
+		return false
+	}
+
+	// 计算当前时间的分钟数（从0点开始）
+	currentMinutes := beijingTime.Hour()*60 + beijingTime.Minute()
+	startMinutes := startHour*60 + startMin
+	endMinutes := endHour*60 + endMin
+
+	// 判断是否在工作时间内
+	inWorkingHours := currentMinutes >= startMinutes && currentMinutes < endMinutes
+
+	logx.Info("工作时间检查",
+		"currentTime:", beijingTime.Format("15:04"),
+		"startTime:", startTime,
+		"endTime:", endTime,
+		"inWorkingHours:", inWorkingHours)
+
+	return inWorkingHours
 }
 
 // SendWebhookNotification 发送企业微信 webhook 通知

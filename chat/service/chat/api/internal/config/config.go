@@ -181,4 +181,12 @@ type Config struct {
 	Webhook struct {
 		TransferToHumanURL string `json:",optional,default="` // 转人工 webhook 地址
 	} `json:",optional"`
+
+	// 人工客服服务时间配置
+	HumanService struct {
+		Enable         bool   `json:",optional,default=false"`                                                                    // 是否启用工作时间限制
+		StartTime      string `json:",optional,default=09:00"`                                                                    // 工作开始时间（北京时间）
+		EndTime        string `json:",optional,default=17:00"`                                                                    // 工作结束时间（北京时间）
+		OfflineMessage string `json:",optional,default=现已超出人工服务时段，无法转接人工，建议使用智能客服处理，人工咨询请上午 9 点后访问。\n\n人工服务时间：09:00-17:00（北京时间）"` // 下班时间提示消息
+	} `json:",optional"`
 }
