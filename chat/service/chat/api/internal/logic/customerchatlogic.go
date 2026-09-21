@@ -49,20 +49,99 @@ func NewCustomerChatLogic(ctx context.Context, svcCtx *svc.ServiceContext) *Cust
 	}
 }
 
+// logTransferRequest 记录转人工请求
+func (l *CustomerChatLogic) logTransferRequest(req *types.CustomerChatReq, reqContent string, transferReason string) (*model.RequestLog, *model.TransferLog) {
+	if l.svcCtx.RequestLogger == nil {
+		return nil, nil
+	}
+	requestID := uuid.New().String()
+	transferID := uuid.New().String()
+	now := time.Now()
+
+	reqLog := &model.RequestLog{
+		RequestID:        requestID,
+		RequestType:      "transfer_op",
+		UserID:           req.CustomerID,
+		UserType:         "customer",
+		AgentID:          0,
+		Channel:          "transfer",
+		ReqContent:       reqContent,
+		ReqContentLength: len([]rune(reqContent)),
+		Status:           "pending",
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+
+	transferLog := &model.TransferLog{
+		TransferID:      transferID,
+		UserID:          req.CustomerID,
+		UserType:        "customer",
+		AgentID:         0,
+		OpenKfID:        req.OpenKfID,
+		RequestID:       requestID,
+		TransferReason:  transferReason,
+		UserMessage:     reqContent,
+		ServiceState:    2,
+		TransferStatus:  "pending",
+		TransferSuccess: false,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+	}
+
+	l.svcCtx.RequestLogger.LogRequestAndTransfer(context.Background(), reqLog, transferLog)
+	return reqLog, transferLog
+}
+
+// updateTransferLog 更新转人工日志
+func (l *CustomerChatLogic) updateTransferLog(transferLog *model.TransferLog, status string, success bool, errMsg string) {
+	if transferLog == nil || l.svcCtx.RequestLogger == nil {
+		return
+	}
+	transferLog.TransferStatus = status
+	transferLog.TransferSuccess = success
+	if errMsg != "" {
+		transferLog.ErrorMsg = errMsg
+	}
+	transferLog.UpdatedAt = time.Now()
+	l.svcCtx.RequestLogger.LogTransfer(context.Background(), transferLog)
+}
+
+// logAIRequestEnd 更新AI请求完成状态
+func (l *CustomerChatLogic) logAIRequestEnd(reqLog *model.RequestLog, resContent string, status string, latencyMs int, tokenInfo ...int) {
+	if reqLog == nil || l.svcCtx.RequestLogger == nil {
+		return
+	}
+	reqLog.ResContent = resContent
+	reqLog.ResContentLength = len([]rune(resContent))
+	reqLog.Status = status
+	reqLog.LatencyMs = latencyMs
+	reqLog.UpdatedAt = time.Now()
+	if len(tokenInfo) >= 1 {
+		reqLog.PromptTokens = tokenInfo[0]
+	}
+	if len(tokenInfo) >= 2 {
+		reqLog.CompletionTokens = tokenInfo[1]
+	}
+	if len(tokenInfo) >= 1 && len(tokenInfo) >= 2 {
+		reqLog.TotalTokens = tokenInfo[0] + tokenInfo[1]
+	}
+	l.svcCtx.RequestLogger.LogRequest(context.Background(), reqLog)
+}
+
 func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *types.CustomerChatReply, err error) {
 
 	l.setModelName().setBasePrompt().setBaseHost()
 
-	// 确认消息没有被处理过
 	table := l.svcCtx.ChatModel.Chat
-	_, err = table.WithContext(l.ctx).
+	_, err = table.WithContext(context.Background()).
 		Where(table.MessageID.Eq(req.MsgID)).Where(table.User.Eq(req.CustomerID)).First()
-	// 消息已处理 或者 查询有问题
 	if err == nil || !errors.Is(err, gorm.ErrRecordNotFound) {
 		return &types.CustomerChatReply{
 			Message: "ok",
 		}, nil
 	}
+
+	fmt.Printf("[对话] 用户: %s\n", req.Msg)
 
 	// 生成会话唯一标识
 	uuidObj, err := uuid.NewUUID()
@@ -72,9 +151,37 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 	}
 	conversationId := uuidObj.String()
 
+	// 记录AI请求开始
+	reqLog := &model.RequestLog{
+		RequestID:        uuid.New().String(),
+		RequestType:      "ai_chat",
+		UserID:           req.CustomerID,
+		UserType:         "customer",
+		AgentID:          0,
+		Channel:          l.svcCtx.Config.ModelProvider.Company,
+		ReqContent:       req.Msg,
+		ReqContentLength: len([]rune(req.Msg)),
+		IsVoice:          l.isVoiceRequest,
+		Status:           "pending",
+		ConversationID:   conversationId,
+		CreatedAt:        time.Now(),
+		UpdatedAt:        time.Now(),
+	}
+	if l.svcCtx.RequestLogger != nil {
+		l.svcCtx.RequestLogger.LogRequest(context.Background(), reqLog)
+	}
+	reqStartTime := time.Now()
+
 	// 指令匹配， 根据响应值判定是否需要去调用 openai 接口了
 	proceed, _ := l.FactoryCommend(req)
 	if !proceed {
+		if reqLog != nil && l.svcCtx.RequestLogger != nil {
+			reqLog.RequestType = "command_op"
+			reqLog.Status = "success"
+			reqLog.LatencyMs = int(time.Since(reqStartTime).Milliseconds())
+			reqLog.UpdatedAt = time.Now()
+			l.svcCtx.RequestLogger.LogRequest(context.Background(), reqLog)
+		}
 		return &types.CustomerChatReply{
 			Message: "ok",
 		}, nil
@@ -247,20 +354,17 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 	// coze 处理
 	if l.svcCtx.Config.ModelProvider.Company == "coze" {
-		l.Logger.Info("进入 Coze 处理逻辑, BotID: ", l.svcCtx.Config.Coze.BotID)
+		// l.Logger.Info("进入 Coze 处理逻辑, BotID: ", l.svcCtx.Config.Coze.BotID)
 		c := coze.NewClient(l.svcCtx.Config.Coze.Host, l.svcCtx.Config.Coze.Key)
 
-		// 从 redis 中获取会话 ID
 		cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
 		conversationId, err := redis.Rdb.Get(context.Background(), cacheKey).Result()
 		if err != nil {
-			l.Logger.Info("Coze 首次对话，无历史会话 ID")
+			// l.Logger.Info("Coze 首次对话，无历史会话 ID")
 		} else {
-			l.Logger.Info("Coze 从 Redis 获取到会话 ID: ", conversationId)
+			// l.Logger.Info("Coze 从 Redis 获取到会话 ID: ", conversationId)
 		}
 
-		// 显式设置 auto_save_history 为 true，让 Coze 自动管理会话历史
-		// 这是 Coze V3 的默认行为，保持与 curl 调用一致
 		autoSaveHistory := true
 		request := &coze.ChatMessageRequest{
 			BotID: l.svcCtx.Config.Coze.BotID,
@@ -270,75 +374,65 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 					Role:        "user",
 					Content:     req.Msg,
 					ContentType: "text",
-					Type:        "question", // Coze V3 需要此字段来正确识别消息类型
+					Type:        "question",
 				},
 			},
-			AutoSaveHistory: &autoSaveHistory, // 显式设置为 true
+			AutoSaveHistory: &autoSaveHistory,
 		}
-		// 只有在 conversationId 非空时才设置
 		if conversationId != "" {
 			request.ConversationID = conversationId
-			l.Logger.Info("Coze 请求中使用历史会话 ID: ", request.ConversationID)
+			// l.Logger.Info("Coze 请求中使用历史会话 ID: ", request.ConversationID)
 		} else {
-			l.Logger.Info("Coze 请求将创建新会话（无历史会话 ID）")
+			// l.Logger.Info("Coze 请求将创建新会话（无历史会话 ID）")
 		}
 
-		// 打印 Coze API 请求详细信息
-		fmt.Println("\n========== [Coze V3 API 请求详情] ==========")
-		fmt.Printf("API Host: %s\n", l.svcCtx.Config.Coze.Host)
-		fmt.Printf("完整 URL: %s/v3/chat\n", l.svcCtx.Config.Coze.Host)
-		fmt.Printf("BotID: %s\n", request.BotID)
-		fmt.Printf("UserID: %s\n", request.User)
-		if len(request.Messages) > 0 {
-			fmt.Printf("AdditionalMessages[%d]: Role=%s, Content=%s, ContentType=%s, Type=%s\n",
-				len(request.Messages), request.Messages[0].Role, request.Messages[0].Content, request.Messages[0].ContentType, request.Messages[0].Type)
-		}
-		fmt.Printf("ConversationID: %s\n", request.ConversationID)
-		fmt.Printf("AutoSaveHistory: %v\n", *request.AutoSaveHistory)
-		fmt.Printf("Stream: %v\n", l.svcCtx.Config.Response.Stream)
-		fmt.Println("=========================================\n")
+		// fmt.Println("\n========== [Coze V3 API 请求详情] ==========")
+		// fmt.Printf("API Host: %s\n", l.svcCtx.Config.Coze.Host)
+		// fmt.Printf("完整 URL: %s/v3/chat\n", l.svcCtx.Config.Coze.Host)
+		// fmt.Printf("BotID: %s\n", request.BotID)
+		// fmt.Printf("UserID: %s\n", request.User)
+		// if len(request.Messages) > 0 {
+		// 	fmt.Printf("AdditionalMessages[%d]: Role=%s, Content=%s, ContentType=%s, Type=%s\n",
+		// 		len(request.Messages), request.Messages[0].Role, request.Messages[0].Content, request.Messages[0].ContentType, request.Messages[0].Type)
+		// }
+		// fmt.Printf("ConversationID: %s\n", request.ConversationID)
+		// fmt.Printf("AutoSaveHistory: %v\n", *request.AutoSaveHistory)
+		// fmt.Printf("Stream: %v\n", l.svcCtx.Config.Response.Stream)
+		// fmt.Println("=========================================\n")
 
 		go func() {
-			// 【关键修复】在开始处理之前，先检查是否已转人工
 			cacheKey := fmt.Sprintf("chat:transfered:%s:%s", req.OpenKfID, req.CustomerID)
 			transfered, _ := redis.Rdb.Get(context.Background(), cacheKey).Bool()
 			if transfered {
-				l.Logger.Info("检测到转人标志，检查企业微信会话状态")
+				// l.Logger.Info("检测到转人标志，检查企业微信会话状态")
 
-				// 查询企业微信客服会话状态
 				serviceState, err := wecom.GetKFServiceState(req.OpenKfID, req.CustomerID)
 				if err != nil {
-					l.Logger.Error("获取会话状态失败，保守处理：放弃调用 Coze API", err)
+					// l.Logger.Error("获取会话状态失败，保守处理：放弃调用 Coze API", err)
 					return
 				}
 
-				// service_state: 0-未处理 1-由智能助手接待 2-待接入池排队中 3-由人工接待 4-已结束/未开始
 				if serviceState == 0 || serviceState == 1 || serviceState == 4 {
-					// 会话未处理、由智能助手接待或已结束，清除转人标志，恢复AI服务
 					_ = redis.Rdb.Del(context.Background(), cacheKey).Err()
-					l.Logger.Info(fmt.Sprintf("会话状态为%d(未处理/智能助手/已结束)，自动清除转人标志，恢复AI服务", serviceState))
-					// 继续执行，调用 Coze API
+					// l.Logger.Info(fmt.Sprintf("会话状态为%d(未处理/智能助手/已结束)，自动清除转人标志，恢复AI服务", serviceState))
 				} else if serviceState == 3 {
-					// 正在由人工接待，不调用 Coze API
-					l.Logger.Info(fmt.Sprintf("会话状态为%d(由人工接待)，放弃调用 Coze API", serviceState))
+					// l.Logger.Info(fmt.Sprintf("会话状态为%d(由人工接待)，放弃调用 Coze API", serviceState))
 					return
 				} else {
-					// service_state == 2 (待接入池排队中)，不调用 Coze API
-					l.Logger.Info(fmt.Sprintf("会话状态为%d(排队中)，放弃调用 Coze API", serviceState))
+					// l.Logger.Info(fmt.Sprintf("会话状态为%d(排队中)，放弃调用 Coze API", serviceState))
 					return
 				}
 			}
 
 			ctx := context.Background()
-			// 设置超时时间为 200 秒
 			ctx, cancel := context.WithTimeout(ctx, 200*time.Second)
 			defer cancel()
 
-			l.Logger.Info("Coze V3 请求参数: BotID=", request.BotID, ", User=", request.User, ", ConversationID=", request.ConversationID)
-			if len(request.Messages) > 0 {
-				l.Logger.Info("Coze V3 消息内容: Role=", request.Messages[0].Role, ", Content=", request.Messages[0].Content)
-			}
-			l.Logger.Info("Coze V3 响应模式 - 流式: ", l.svcCtx.Config.Response.Stream)
+			// l.Logger.Info("Coze V3 请求参数: BotID=", request.BotID, ", User=", request.User, ", ConversationID=", request.ConversationID)
+			// if len(request.Messages) > 0 {
+			// 	l.Logger.Info("Coze V3 消息内容: Role=", request.Messages[0].Role, ", Content=", request.Messages[0].Content)
+			// }
+			// l.Logger.Info("Coze V3 响应模式 - 流式: ", l.svcCtx.Config.Response.Stream)
 
 			// Coze API v2 建议使用流式响应
 			// 如果配置为非流式，也尝试使用，但可能会返回空结果
@@ -346,143 +440,109 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 			if useStream {
 				var (
-					messageText       string
 					rs                []rune
-					chatID            string // 保存 chat_id 用于后续获取消息
-					newConversationID string // 保存 Coze 返回的新 conversation_id
+					chatID            string
+					newConversationID string
 				)
 
 				// 使用 Chat API 的流式响应
 				streamChannel, err := c.API().ChatMessagesStream(ctx, request)
 				if err != nil {
 					errInfo := err.Error()
+					l.logAIRequestEnd(reqLog, errInfo, "failed", int(time.Since(reqStartTime).Milliseconds()))
 					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
 					return
 				}
 
-				// 处理流式响应
 				for response := range streamChannel {
 					if response.Err != nil {
 						errInfo := response.Err.Error()
-						l.Logger.Error("coze V3 流式响应错误: ", errInfo)
+						l.logAIRequestEnd(reqLog, errInfo, "failed", int(time.Since(reqStartTime).Milliseconds()))
+						// l.Logger.Error("coze V3 流式响应错误: ", errInfo)
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
 						return
 					}
 
-					// 打印所有接收到的事件用于调试
-					l.Logger.Info(fmt.Sprintf("Coze V3 Stream Event: '%s', HasData: %v", response.Event, response.Data != nil))
-					if response.Data != nil {
-						l.Logger.Info(fmt.Sprintf("  Data Type: '%s', Role: '%s', Content Length: %d",
-							response.Data.Type, response.Data.Role, len(response.Data.Content)))
-						if len(response.Data.Content) < 100 {
-							l.Logger.Info(fmt.Sprintf("  Content: '%s'", response.Data.Content))
-						}
-					} else {
-						// 额外调试：检查是否是预期的无数据事件
-						if response.Event == "conversation.message.delta" || response.Event == "conversation.message.completed" {
-							l.Logger.Error(fmt.Sprintf("⚠️ 关键事件 '%s' 的 Data 为 nil！这可能是一个 bug", response.Event))
-						}
-					}
+					// l.Logger.Info(fmt.Sprintf("Coze V3 Stream Event: '%s', HasData: %v", response.Event, response.Data != nil))
+					// if response.Data != nil {
+					// 	l.Logger.Info(fmt.Sprintf("  Data Type: '%s', Role: '%s', Content Length: %d",
+					// 		response.Data.Type, response.Data.Role, len(response.Data.Content)))
+					// 	if len(response.Data.Content) < 100 {
+					// 		l.Logger.Info(fmt.Sprintf("  Content: '%s'", response.Data.Content))
+					// 	}
+					// } else {
+					// 	if response.Event == "conversation.message.delta" || response.Event == "conversation.message.completed" {
+					// 		l.Logger.Error(fmt.Sprintf("⚠️ 关键事件 '%s' 的 Data 为 nil！这可能是一个 bug", response.Event))
+					// 	}
+					// }
 
-					// 检查是否有错误状态
 					if response.LastError != nil && response.LastError.Code != 0 {
 						errMsg := fmt.Sprintf("Coze API 错误 [%d]: %s", response.LastError.Code, response.LastError.Msg)
-						l.Logger.Error(errMsg)
+						l.logAIRequestEnd(reqLog, errMsg, "failed", int(time.Since(reqStartTime).Milliseconds()))
+						// l.Logger.Error(errMsg)
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errMsg, l.svcCtx.Config)
 						return
 					}
 
-					// 检查会话状态
 					if response.Status == "failed" {
-						l.Logger.Error("Coze V3 会话失败")
+						// l.Logger.Error("Coze V3 会话失败")
+						l.logAIRequestEnd(reqLog, "Coze 会话处理失败", "failed", int(time.Since(reqStartTime).Milliseconds()))
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:Coze 会话处理失败", l.svcCtx.Config)
 						return
 					}
 
-					// 保存 conversation_id 到 redis（优先从顶层字段获取）
 					if response.ConversationID != "" {
-						// 保存新的 conversation_id 供后续使用
 						newConversationID = response.ConversationID
 
-						// 关键修复：只有当请求中没有传入 conversation_id 时，才保存新的会话 ID
-						// 这样可以避免 Coze 返回的新 ID 覆盖已有的会话 ID
 						if request.ConversationID == "" {
-							// 首次对话，保存新创建的会话 ID
-							l.Logger.Info("Coze V3 创建新会话 ID: ", response.ConversationID)
+							// l.Logger.Info("Coze V3 创建新会话 ID: ", response.ConversationID)
 							cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
-							err := redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
-							if err != nil {
-								l.Logger.Error("Coze 保存会话 ID 到 Redis 失败: ", err)
-							} else {
-								l.Logger.Info("Coze 会话 ID 已保存到 Redis")
-							}
+							_ = redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
 						} else if response.ConversationID != request.ConversationID {
-							// 传入了会话 ID，但 Coze 返回了不同的 ID
-							// 这说明 Coze 认为旧会话已失效或不存在，需要更新为新 ID
-							l.Logger.Info(fmt.Sprintf("⚠️ Coze V3 返回的会话 ID 与请求不同 - 请求: %s, 响应: %s",
-								request.ConversationID, response.ConversationID))
-							l.Logger.Info("更新 Redis 中的会话 ID 为新值: ", response.ConversationID)
-
-							// 更新 Redis 中的 conversation_id
+							// l.Logger.Info(fmt.Sprintf("⚠️ Coze V3 返回的会话 ID 与请求不同 - 请求: %s, 响应: %s",
+							// 	request.ConversationID, response.ConversationID))
+							// l.Logger.Info("更新 Redis 中的会话 ID 为新值: ", response.ConversationID)
 							cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
-							err := redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
-							if err != nil {
-								l.Logger.Error("Coze 更新会话 ID 到 Redis 失败: ", err)
-							} else {
-								l.Logger.Info("Coze 会话 ID 已更新到 Redis")
-							}
+							_ = redis.Rdb.Set(context.Background(), cacheKey, response.ConversationID, 24*time.Hour).Err()
 						} else {
-							// 返回的 ID 与请求一致，无需操作
-							l.Logger.Debug("Coze V3 返回会话 ID (与请求一致): ", response.ConversationID)
+							// l.Logger.Debug("Coze V3 返回会话 ID (与请求一致): ", response.ConversationID)
 						}
 					}
 
-					// 保存 chat_id （从 completed 事件的 id 字段获取）
 					if response.Event == "conversation.chat.completed" && response.ID != "" {
 						chatID = response.ID
-						l.Logger.Info("Coze V3 返回 Chat ID: ", chatID)
+						// l.Logger.Info("Coze V3 返回 Chat ID: ", chatID)
 					}
 
-					// 累积回答文本 - V3 API 使用 Data.Type 来判断消息类型
-					// 处理 conversation.message.delta 和 conversation.message.completed 事件
 					if (response.Event == "conversation.message.delta" || response.Event == "conversation.message.completed") && response.Data != nil {
-						l.Logger.Debug(fmt.Sprintf("Coze V3 流式响应 - Event: '%s', Type: '%s', Role: '%s', Content Length: %d",
-							response.Event, response.Data.Type, response.Data.Role, len(response.Data.Content)))
+						// l.Logger.Debug(fmt.Sprintf("Coze V3 流式响应 - Event: '%s', Type: '%s', Role: '%s', Content Length: %d",
+						// 	response.Event, response.Data.Type, response.Data.Role, len(response.Data.Content)))
 
-						// 关键修复：累积所有 assistant 角色的 answer 类型消息
-						// 不要过滤 type，因为 Coze 可能将长回复分成多个 delta 事件
 						if response.Data.Role == "assistant" && response.Data.Type == "answer" && response.Data.Content != "" {
-							l.Logger.Debug("coze V3 流式响应片段: ", response.Data.Content)
+							// l.Logger.Debug("coze V3 流式响应片段: ", response.Data.Content)
 							rs = append(rs, []rune(response.Data.Content)...)
-							messageText = string(rs)
 						} else if response.Data.Content != "" {
-							// 记录其他类型的消息，用于调试
-							l.Logger.Info(fmt.Sprintf("Coze V3 收到非 answer 类型消息 - Type: '%s', Role: '%s', Content: '%s'",
-								response.Data.Type, response.Data.Role, response.Data.Content))
+							// l.Logger.Info(fmt.Sprintf("Coze V3 收到非 answer 类型消息 - Type: '%s', Role: '%s', Content: '%s'",
+							// 	response.Data.Type, response.Data.Role, response.Data.Content))
 						}
 					}
 				}
 
-				// 流式响应结束
-				// 关键修复：始终使用 GetMessageListByChatID 获取完整消息，避免流式响应内容不完整
-				l.Logger.Info("coze 流式响应结束，通过 GetMessageList 获取完整消息")
-				l.Logger.Info(fmt.Sprintf("流式响应累积的内容长度: %d, 内容预览: %s", len(rs), messageText))
+				// l.Logger.Info("coze 流式响应结束，通过 GetMessageList 获取完整消息")
+				// l.Logger.Info(fmt.Sprintf("流式响应累积的内容长度: %d, 内容预览: %s", len(rs), messageText))
 
-				// 使用 Coze 返回的新 conversation_id
 				useConversationID := newConversationID
 				if useConversationID == "" {
-					// 如果没有新 ID，则尝试从 Redis 获取
 					cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
 					useConversationID, _ = redis.Rdb.Get(context.Background(), cacheKey).Result()
 				}
 
 				if useConversationID != "" && chatID != "" {
-					// 使用 chat_id 调用 GetMessageList API，带重试机制（最多重试3次）
-					l.Logger.Info(fmt.Sprintf("使用 Chat ID: %s 和 Conversation ID: %s 获取消息", chatID, useConversationID))
+					// l.Logger.Info(fmt.Sprintf("使用 Chat ID: %s 和 Conversation ID: %s 获取消息", chatID, useConversationID))
 					var msgResp *coze.MessageListResponse
 					for i := 0; i < 3; i++ {
 						if i > 0 {
-							l.Logger.Info(fmt.Sprintf("GetMessageListByChatID Retry %d/3 after delay...", i))
+							// l.Logger.Info(fmt.Sprintf("GetMessageListByChatID Retry %d/3 after delay...", i))
 							select {
 							case <-ctx.Done():
 								return
@@ -492,11 +552,10 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 						msgResp, err = c.API().GetMessageListByChatID(ctx, chatID, useConversationID, request.BotID)
 						if err != nil {
-							l.Logger.Error("GetMessageListByChatID 失败: ", err)
+							// l.Logger.Error("GetMessageListByChatID 失败: ", err)
 							continue
 						}
 
-						// 如果成功且返回了消息，直接返回
 						if msgResp.Code == 0 {
 							data, parseErr := msgResp.GetMessageListData()
 							if parseErr == nil && len(data.Items) > 0 {
@@ -504,62 +563,55 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 							}
 						}
 
-						// 如果是无效聊天错误，继续重试
 						if msgResp.Code == 4001 {
-							l.Logger.Info("Got invalid chat error, will retry...")
+							// l.Logger.Info("Got invalid chat error, will retry...")
 							continue
 						}
 
-						// 其他错误，直接返回
 						break
 					}
 
 					if err != nil {
-						l.Logger.Error("GetMessageListByChatID 最终失败: ", err)
+						// l.Logger.Error("GetMessageListByChatID 最终失败: ", err)
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:获取消息失败", l.svcCtx.Config)
 						return
 					}
 
-					// 打印完整的响应数据用于调试
-					l.Logger.Info("GetMessageListByChatID 完整响应: ", msgResp)
+					// l.Logger.Info("GetMessageListByChatID 完整响应: ", msgResp)
 
-					// 解析 Data 字段
 					data, err := msgResp.GetMessageListData()
 					if err != nil {
-						l.Logger.Error("GetMessageListByChatID 解析 Data 失败: ", err)
-						l.Logger.Info("GetMessageListByChatID Raw Data: ", msgResp.Data)
+						// l.Logger.Error("GetMessageListByChatID 解析 Data 失败: ", err)
+						// l.Logger.Info("GetMessageListByChatID Raw Data: ", msgResp.Data)
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:解析消息失败", l.svcCtx.Config)
 						return
 					}
 
-					l.Logger.Info("GetMessageListByChatID 返回消息数量: ", len(data.Items))
-					for i, msg := range data.Items {
-						l.Logger.Info(fmt.Sprintf("GetMessageListByChatID 消息[%d]: Role=%s, Type=%s, ContentType=%s, Content=%s",
-							i, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent()))
-					}
+					// l.Logger.Info("GetMessageListByChatID 返回消息数量: ", len(data.Items))
+					// for i, msg := range data.Items {
+					// 	l.Logger.Info(fmt.Sprintf("GetMessageListByChatID 消息[%d]: Role=%s, Type=%s, ContentType=%s, Content=%s",
+					// 		i, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent()))
+					// }
 
-					// 查找 assistant 的 answer 消息
 					var messageText string
-					// 关键修复：累积所有 type=answer 的消息，而不是只取第一条
 					for _, msg := range data.Items {
 						if msg.Role == "assistant" && msg.Type == "answer" {
 							content := msg.GetTextContent()
 							if content != "" {
-								messageText += content // 累积所有内容
-								l.Logger.Info(fmt.Sprintf("累积 answer 消息: %s", content))
+								messageText += content
+								// l.Logger.Info(fmt.Sprintf("累积 answer 消息: %s", content))
 							}
 						}
 					}
 
-					// 如果没找到，尝试查找所有 assistant 角色的消息
 					if messageText == "" {
-						l.Logger.Info("未找到 type=answer 的消息，尝试查找所有 assistant 消息")
+						// l.Logger.Info("未找到 type=answer 的消息，尝试查找所有 assistant 消息")
 						for _, msg := range data.Items {
 							if msg.Role == "assistant" {
 								content := msg.GetTextContent()
 								if content != "" {
 									messageText = content
-									l.Logger.Info(fmt.Sprintf("找到 assistant 消息: Type=%s, ContentType=%s", msg.Type, msg.ContentType))
+									// l.Logger.Info(fmt.Sprintf("找到 assistant 消息: Type=%s, ContentType=%s", msg.Type, msg.ContentType))
 									break
 								}
 							}
@@ -567,41 +619,35 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 					}
 
 					if messageText != "" {
-						l.Logger.Info("从 GetMessageListByChatID 获取到消息: ", messageText)
+						// l.Logger.Info("从 GetMessageListByChatID 获取到消息: ", messageText)
 
-						// 【关键修复】在发送之前检查是否已转人工
 						cacheKey := fmt.Sprintf("chat:transfered:%s:%s", req.OpenKfID, req.CustomerID)
 						transfered, _ := redis.Rdb.Get(context.Background(), cacheKey).Bool()
 						if transfered {
-							l.Logger.Info("检测到转人标志，再次检查企业微信会话状态")
+							// l.Logger.Info("检测到转人标志，再次检查企业微信会话状态")
 
-							// 查询企业微信客服会话状态
 							serviceState, err := wecom.GetKFServiceState(req.OpenKfID, req.CustomerID)
 							if err != nil {
-								l.Logger.Error("获取会话状态失败，保守处理：放弃发送Coze回复", err)
+								// l.Logger.Error("获取会话状态失败，保守处理：放弃发送Coze回复", err)
 								return
 							}
 
-							// service_state: 0-未处理 1-由智能助手接待 2-待接入池排队中 3-由人工接待 4-已结束/未开始
 							if serviceState == 0 || serviceState == 1 || serviceState == 4 {
-								// 会话未处理、由智能助手接待或已结束，清除转人标志，恢复AI服务
 								_ = redis.Rdb.Del(context.Background(), cacheKey).Err()
-								l.Logger.Info(fmt.Sprintf("会话状态为%d(未处理/智能助手/已结束)，自动清除转人标志，继续发送Coze回复", serviceState))
-								// 继续执行，发送消息
+								// l.Logger.Info(fmt.Sprintf("会话状态为%d(未处理/智能助手/已结束)，自动清除转人标志，继续发送Coze回复", serviceState))
 							} else if serviceState == 3 {
-								// 正在由人工接待，不发送 Coze 回复
-								l.Logger.Info(fmt.Sprintf("会话状态为%d(由人工接待)，放弃发送Coze回复", serviceState))
+								// l.Logger.Info(fmt.Sprintf("会话状态为%d(由人工接待)，放弃发送Coze回复", serviceState))
 								return
 							} else {
-								// service_state == 2 (待接入池排队中)，不发送 Coze 回复
-								l.Logger.Info(fmt.Sprintf("会话状态为%d(排队中)，放弃发送Coze回复", serviceState))
+								// l.Logger.Info(fmt.Sprintf("会话状态为%d(排队中)，放弃发送Coze回复", serviceState))
 								return
 							}
 						}
 
+						fmt.Printf("[对话] 智能体: %s\n", messageText)
+
 						go sendToUser(req.OpenKfID, req.CustomerID, messageText+"\n--------------------------------\n"+req.Msg, l.svcCtx.Config)
 
-						// 将对话记录存储到数据库
 						table := l.svcCtx.ChatModel.Chat
 						_ = table.WithContext(context.Background()).Create(&model.Chat{
 							User:       req.CustomerID,
@@ -610,103 +656,87 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 							ReqContent: req.Msg,
 							ResContent: messageText,
 						})
+						l.logAIRequestEnd(reqLog, messageText, "success", int(time.Since(reqStartTime).Milliseconds()))
 					} else {
-						l.Logger.Error("GetMessageListByChatID 未找到有效消息")
+						// l.Logger.Error("GetMessageListByChatID 未找到有效消息")
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:Coze未返回有效回复，请稍后重试", l.svcCtx.Config)
 					}
 				} else {
-					l.Logger.Error(fmt.Sprintf("未找到会话 ID 或 Chat ID - ConversationID: %s, ChatID: %s", useConversationID, chatID))
+					// l.Logger.Error(fmt.Sprintf("未找到会话 ID 或 Chat ID - ConversationID: %s, ChatID: %s", useConversationID, chatID))
 					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:会话信息丢失，请重新开始对话", l.svcCtx.Config)
 				}
 			} else {
-				l.Logger.Info("coze V3 处理 非流式响应")
-				// 非流式响应
+				// l.Logger.Info("coze V3 处理 非流式响应")
 				resp, err := c.API().ChatMessages(ctx, request)
 				if err != nil {
 					errInfo := err.Error()
-					l.Logger.Error("coze V3 非流式响应错误: ", errInfo)
+					l.logAIRequestEnd(reqLog, errInfo, "failed", int(time.Since(reqStartTime).Milliseconds()))
+					// l.Logger.Error("coze V3 非流式响应错误: ", errInfo)
 					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:"+errInfo, l.svcCtx.Config)
 					return
 				}
 
-				l.Logger.Info("coze V3 非流式响应原始数据: ", resp)
+				// l.Logger.Info("coze V3 非流式响应原始数据: ", resp)
 
-				// V3 API 响应中不再直接包含消息内容，需要通过 GetMessageList 获取
 				var messageText string
 				if resp.Code == 0 && resp.Data.Status == "completed" {
-					l.Logger.Info("Coze V3 响应状态: ", resp.Data.Status)
+					// l.Logger.Info("Coze V3 响应状态: ", resp.Data.Status)
 
-					// 保存 conversation_id 到 redis
 					if resp.Data.ConversationID != "" {
-						// 关键修复：只有当请求中没有传入 conversation_id 时，才保存新的会话 ID
 						if request.ConversationID == "" {
-							// 首次对话，保存新创建的会话 ID
-							l.Logger.Info("Coze V3 非流式响应创建新会话 ID: ", resp.Data.ConversationID)
+							// l.Logger.Info("Coze V3 非流式响应创建新会话 ID: ", resp.Data.ConversationID)
 							cacheKey := fmt.Sprintf("coze:conversation:%s:%s", req.OpenKfID, req.CustomerID)
-							err := redis.Rdb.Set(context.Background(), cacheKey, resp.Data.ConversationID, 24*time.Hour).Err()
-							if err != nil {
-								l.Logger.Error("Coze 保存会话 ID 到 Redis 失败: ", err)
-							} else {
-								l.Logger.Info("Coze 会话 ID 已保存到 Redis")
-							}
+							_ = redis.Rdb.Set(context.Background(), cacheKey, resp.Data.ConversationID, 24*time.Hour).Err()
 						} else if resp.Data.ConversationID != request.ConversationID {
-							// 传入了会话 ID，但 Coze 返回了不同的 ID - 这是正常现象，不要覆盖
-							l.Logger.Info(fmt.Sprintf("ℹ️ Coze V3 非流式响应返回的会话 ID 与请求不同（忽略）- 请求: %s, 响应: %s",
-								request.ConversationID, resp.Data.ConversationID))
-							l.Logger.Info("继续使用原会话 ID: ", request.ConversationID)
+							// l.Logger.Info(fmt.Sprintf("ℹ️ Coze V3 非流式响应返回的会话 ID 与请求不同（忽略）- 请求: %s, 响应: %s",
+							// 	request.ConversationID, resp.Data.ConversationID))
+							// l.Logger.Info("继续使用原会话 ID: ", request.ConversationID)
 						} else {
-							// 返回的 ID 与请求一致，无需操作
-							l.Logger.Debug("Coze V3 非流式响应返回会话 ID (与请求一致): ", resp.Data.ConversationID)
+							// l.Logger.Debug("Coze V3 非流式响应返回会话 ID (与请求一致): ", resp.Data.ConversationID)
 						}
 
-						// 调用 GetMessageList API 获取实际消息内容
 						msgResp, err := c.API().GetMessageList(ctx, resp.Data.ConversationID, request.BotID)
 						if err != nil {
-							l.Logger.Error("GetMessageList 失败: ", err)
+							// l.Logger.Error("GetMessageList 失败: ", err)
 							sendToUser(req.OpenKfID, req.CustomerID, "系统错误:获取消息失败", l.svcCtx.Config)
 							return
 						}
 
-						// 打印完整的响应数据用于调试
-						l.Logger.Info("GetMessageList 完整响应: ", msgResp)
+						// l.Logger.Info("GetMessageList 完整响应: ", msgResp)
 
-						// 解析 Data 字段
 						data, err := msgResp.GetMessageListData()
 						if err != nil {
-							l.Logger.Error("GetMessageList 解析 Data 失败: ", err)
-							l.Logger.Info("GetMessageList Raw Data: ", msgResp.Data)
+							// l.Logger.Error("GetMessageList 解析 Data 失败: ", err)
+							// l.Logger.Info("GetMessageList Raw Data: ", msgResp.Data)
 							sendToUser(req.OpenKfID, req.CustomerID, "系统错误:解析消息失败", l.svcCtx.Config)
 							return
 						}
 
-						l.Logger.Info("GetMessageList 返回消息数量: ", len(data.Items))
-						for i, msg := range data.Items {
-							l.Logger.Info(fmt.Sprintf("GetMessageList 消息[%d]: Role=%s, Type=%s, ContentType=%s, Content=%s",
-								i, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent()))
-						}
+						// l.Logger.Info("GetMessageList 返回消息数量: ", len(data.Items))
+						// for i, msg := range data.Items {
+						// 	l.Logger.Info(fmt.Sprintf("GetMessageList 消息[%d]: Role=%s, Type=%s, ContentType=%s, Content=%s",
+						// 		i, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent()))
+						// }
 
-						// 查找 assistant 的 answer 消息
-						// 首先尝试查找 type=answer 的消息
 						for _, msg := range data.Items {
 							if msg.Role == "assistant" && msg.Type == "answer" {
 								content := msg.GetTextContent()
 								if content != "" {
 									messageText = content
-									l.Logger.Info("找到 type=answer 的消息")
+									// l.Logger.Info("找到 type=answer 的消息")
 									break
 								}
 							}
 						}
 
-						// 如果没找到，尝试查找所有 assistant 角色的消息
 						if messageText == "" {
-							l.Logger.Info("未找到 type=answer 的消息，尝试查找所有 assistant 消息")
+							// l.Logger.Info("未找到 type=answer 的消息，尝试查找所有 assistant 消息")
 							for _, msg := range data.Items {
 								if msg.Role == "assistant" {
 									content := msg.GetTextContent()
 									if content != "" {
 										messageText = content
-										l.Logger.Info(fmt.Sprintf("找到 assistant 消息: Type=%s, ContentType=%s", msg.Type, msg.ContentType))
+										// l.Logger.Info(fmt.Sprintf("找到 assistant 消息: Type=%s, ContentType=%s", msg.Type, msg.ContentType))
 										break
 									}
 								}
@@ -714,30 +744,33 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 						}
 
 						if messageText == "" {
-							l.Logger.Error("GetMessageList 未找到有效消息")
+							// l.Logger.Error("GetMessageList 未找到有效消息")
+							l.logAIRequestEnd(reqLog, "未收到Coze响应", "failed", int(time.Since(reqStartTime).Milliseconds()))
 							sendToUser(req.OpenKfID, req.CustomerID, "系统错误:未收到Coze响应", l.svcCtx.Config)
 							return
 						}
 
-						l.Logger.Info("从 GetMessageList 获取到消息: ", messageText)
+						// l.Logger.Info("从 GetMessageList 获取到消息: ", messageText)
 					} else {
-						l.Logger.Error("Coze V3 响应未返回会话 ID")
+						// l.Logger.Error("Coze V3 响应未返回会话 ID")
+						l.logAIRequestEnd(reqLog, "未收到Coze响应", "failed", int(time.Since(reqStartTime).Milliseconds()))
 						sendToUser(req.OpenKfID, req.CustomerID, "系统错误:未收到Coze响应", l.svcCtx.Config)
 						return
 					}
 				} else {
-					l.Logger.Error("Coze V3 响应失败: Code=", resp.Code, ", Status=", resp.Data.Status)
-					if resp.Data.LastError.Code != 0 {
-						l.Logger.Error("错误详情: Code=", resp.Data.LastError.Code, ", Msg=", resp.Data.LastError.Msg)
-					}
+					// l.Logger.Error("Coze V3 响应失败: Code=", resp.Code, ", Status=", resp.Data.Status)
+					// if resp.Data.LastError.Code != 0 {
+					// 	l.Logger.Error("错误详情: Code=", resp.Data.LastError.Code, ", Msg=", resp.Data.LastError.Msg)
+					// }
+					l.logAIRequestEnd(reqLog, "Coze处理失败", "failed", int(time.Since(reqStartTime).Milliseconds()))
 					sendToUser(req.OpenKfID, req.CustomerID, "系统错误:Coze处理失败", l.svcCtx.Config)
 					return
 				}
 
-				// 把数据发给微信用户
+				fmt.Printf("[对话] 智能体: %s\n", messageText)
+
 				go sendToUser(req.OpenKfID, req.CustomerID, messageText, l.svcCtx.Config)
 
-				// 再去插入数据
 				table := l.svcCtx.ChatModel.Chat
 				_ = table.WithContext(context.Background()).Create(&model.Chat{
 					User:       req.CustomerID,
@@ -746,7 +779,8 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 					ReqContent: req.Msg,
 					ResContent: messageText,
 				})
-				l.Logger.Debug("coze 处理完成: ", messageText)
+				l.logAIRequestEnd(reqLog, messageText, "success", int(time.Since(reqStartTime).Milliseconds()))
+				// l.Logger.Debug("coze 处理完成: ", messageText)
 			}
 		}()
 
@@ -882,14 +916,11 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 	company := l.svcCtx.Config.ModelProvider.Company
 	modelName := ""
 	var temperature float32
-	// 找到 客服 对应的应用机器人
 	botCustomerTable := l.svcCtx.ChatModel.BotsWithCustom
-	botCustomer, botCustomerSelectErr := botCustomerTable.WithContext(l.ctx).Where(botCustomerTable.OpenKfID.Eq(req.OpenKfID)).First()
+	botCustomer, botCustomerSelectErr := botCustomerTable.WithContext(context.Background()).Where(botCustomerTable.OpenKfID.Eq(req.OpenKfID)).First()
 	if botCustomerSelectErr == nil {
-		// 去找到 bot 机器人对应的model 配置
 		botWithModelTable := l.svcCtx.ChatModel.BotsWithModel
-		// 找到第一个配置
-		firstModel, selectModelErr := botWithModelTable.WithContext(l.ctx).
+		firstModel, selectModelErr := botWithModelTable.WithContext(context.Background()).
 			Where(botWithModelTable.BotID.Eq(botCustomer.BotID)).
 			First()
 		if selectModelErr == nil {
@@ -927,13 +958,13 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 		// 如果绑定了bot，那就使用bot 的 prompt 跟 各种其它设定
 		botWithCustomTable := l.svcCtx.ChatModel.BotsWithCustom
-		first, err := botWithCustomTable.WithContext(l.ctx).Where(botWithCustomTable.OpenKfID.Eq(req.OpenKfID)).First()
+		first, err := botWithCustomTable.WithContext(context.Background()).Where(botWithCustomTable.OpenKfID.Eq(req.OpenKfID)).First()
 		if err == nil {
 			botTable := l.svcCtx.ChatModel.Bot
-			bot, err := botTable.WithContext(l.ctx).Where(botTable.ID.Eq(first.BotID)).First()
+			bot, err := botTable.WithContext(context.Background()).Where(botTable.ID.Eq(first.BotID)).First()
 			if err == nil {
 				botPromptTable := l.svcCtx.ChatModel.BotsPrompt
-				botPrompt, err := botPromptTable.WithContext(l.ctx).Where(botPromptTable.BotID.Eq(bot.ID)).First()
+				botPrompt, err := botPromptTable.WithContext(context.Background()).Where(botPromptTable.BotID.Eq(bot.ID)).First()
 				if err == nil {
 					l.svcCtx.Config.Gemini.Prompt = botPrompt.Prompt
 				}
@@ -1057,13 +1088,13 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 		// 如果绑定了bot，那就使用bot 的 prompt 跟 各种其它设定
 		botWithCustomTable := l.svcCtx.ChatModel.BotsWithCustom
-		first, err := botWithCustomTable.WithContext(l.ctx).Where(botWithCustomTable.OpenKfID.Eq(req.OpenKfID)).First()
+		first, err := botWithCustomTable.WithContext(context.Background()).Where(botWithCustomTable.OpenKfID.Eq(req.OpenKfID)).First()
 		if err == nil {
 			botTable := l.svcCtx.ChatModel.Bot
-			bot, err := botTable.WithContext(l.ctx).Where(botTable.ID.Eq(first.BotID)).First()
+			bot, err := botTable.WithContext(context.Background()).Where(botTable.ID.Eq(first.BotID)).First()
 			if err == nil {
 				botPromptTable := l.svcCtx.ChatModel.BotsPrompt
-				botPrompt, err := botPromptTable.WithContext(l.ctx).Where(botPromptTable.BotID.Eq(bot.ID)).First()
+				botPrompt, err := botPromptTable.WithContext(context.Background()).Where(botPromptTable.BotID.Eq(bot.ID)).First()
 				if err == nil {
 					l.basePrompt = botPrompt.Prompt
 				}
@@ -1464,7 +1495,7 @@ type CustomerCommendHelp struct{}
 
 func (p CustomerCommendHelp) customerExec(l *CustomerChatLogic, req *types.CustomerChatReq) bool {
 	tips := fmt.Sprintf(
-		"支持指令：\n\n%s\n%s\n%s\n%s\n%s\n",
+		"支持指令：\n\n%s\n%s\n%s\n%s\n%s\n%s\n",
 		"基础模块🕹️\n\n#help       查看所有指令",
 		"#system 查看会话系统信息",
 		"#clear 清空当前会话的数据",
@@ -1514,6 +1545,10 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 	// 调用企业微信 API 转人工客服
 	// service_state: 0-未处理 1-由AI接待 2-由人工接待 3-已转人工
 
+	// 记录转人工请求
+	_, transferLog := l.logTransferRequest(req, req.Msg, "用户请求转人工")
+	transferStart := time.Now()
+
 	// 获取配置的服务状态和接待人员ID
 	serviceState := 2 // 默认值：排队等待接待
 	servicerUserID := ""
@@ -1545,9 +1580,17 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 					"totalServicers:", len(app.ServicerUserIDs),
 					"currentIndex:", currentIndex,
 					"assignedServicer:", servicerUserID)
+				if transferLog != nil {
+					transferLog.AssignedServicerID = servicerUserID
+					transferLog.AssignmentType = "round_robin"
+				}
 			} else if app.ServicerUserID != "" {
 				// 如果没有配置列表，使用单个 ServicerUserID（兼容旧配置）
 				servicerUserID = app.ServicerUserID
+				if transferLog != nil {
+					transferLog.AssignedServicerID = servicerUserID
+					transferLog.AssignmentType = "direct"
+				}
 			}
 			break
 		}
@@ -1562,6 +1605,7 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 	// 如果 serviceState=3，则 servicerUserID 必填
 	if serviceState == 3 && servicerUserID == "" {
 		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败: 系统未配置默认接待人员，请联系管理员配置", l.svcCtx.Config)
+		l.updateTransferLog(transferLog, "cancelled", false, "系统未配置默认接待人员")
 		return false
 	}
 
@@ -1580,6 +1624,10 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 				offlineMessage = "现已超出人工服务时段，无法转接人工，建议使用智能客服处理，人工咨询请上午 9 点后访问。\n\n人工服务时间：09:00-17:00（北京时间）"
 			}
 			sendToUser(req.OpenKfID, req.CustomerID, offlineMessage, l.svcCtx.Config)
+			if transferLog != nil {
+				transferLog.WasInWorkingHours = false
+			}
+			l.updateTransferLog(transferLog, "cancelled", false, "当前不在工作时间内")
 			return false
 		}
 	}
@@ -1616,8 +1664,16 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 	err := wecom.TransferToHumanServiceState(req.OpenKfID, req.CustomerID, serviceState, servicerUserID)
 	if err != nil {
 		sendToUser(req.OpenKfID, req.CustomerID, "转人工客服失败:"+err.Error(), l.svcCtx.Config)
+		l.updateTransferLog(transferLog, "failed", false, err.Error())
 		return false
 	}
+
+	// 转人工成功，更新日志
+	if transferLog != nil {
+		transferLog.ServiceState = int32(serviceState)
+		transferLog.WaitDurationMs = int32(time.Since(transferStart).Milliseconds())
+	}
+	l.updateTransferLog(transferLog, "pending", true, "")
 
 	// 发送 webhook 通知
 	if l.svcCtx.Config.Webhook.TransferToHumanURL != "" {
@@ -1633,6 +1689,10 @@ func (p CustomerCommendTransferToHuman) customerExec(l *CustomerChatLogic, req *
 				l.Logger.Error("webhook 通知发送失败: ", err.Error())
 			}
 		}()
+		if transferLog != nil {
+			transferLog.WebhookNotified = true
+			l.updateTransferLog(transferLog, "pending", true, "")
+		}
 	}
 
 	return false

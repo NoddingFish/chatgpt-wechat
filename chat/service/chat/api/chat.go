@@ -48,6 +48,7 @@ func main() {
 
 	ctx := svc.NewServiceContext(c)
 	handler.RegisterHandlers(server, ctx)
+	wecom.InitDB(ctx.DbEngin)
 	wecom.WeCom.RestPort = c.RestConf.Port
 	wecom.WeCom.Port = c.WeCom.Port
 	wecom.WeCom.CorpID = c.WeCom.CorpID

@@ -1,6 +1,7 @@
 package svc
 
 import (
+	requestlogger "chat/common/requestlogger"
 	"chat/service/chat/api/internal/config"
 	"chat/service/chat/api/internal/middleware"
 	"chat/service/chat/dao"
@@ -8,7 +9,7 @@ import (
 	"github.com/zeromicro/go-zero/rest"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
+	gormlogger "gorm.io/gorm/logger"
 )
 
 type ServiceContext struct {
@@ -21,24 +22,18 @@ type ServiceContext struct {
 	BotModel          *dao.Query
 	BotsPromptModel   *dao.Query
 	Knowledge         *dao.Query
+	RequestLogger     *requestlogger.RequestLogger
 	AccessLog         rest.Middleware
 }
 
 func NewServiceContext(c config.Config) *ServiceContext {
-	//启动Gorm支持
-	//db, err := gorm.Open(mysql.Open(c.Mysql.DataSource), &gorm.Config{
-	//	DisableForeignKeyConstraintWhenMigrating: true,
-	//	SkipDefaultTransaction:                   true,
-	//	Logger:                                   logger.Default.LogMode(logger.Info),
-	//})
-
 	db, err := gorm.Open(postgres.New(postgres.Config{
 		DSN:                  c.PGSql.DataSource,
 		PreferSimpleProtocol: true, // disables implicit prepared statement usage
 	}), &gorm.Config{
 		DisableForeignKeyConstraintWhenMigrating: true,
 		SkipDefaultTransaction:                   true,
-		Logger:                                   logger.Default.LogMode(logger.Info),
+		Logger:                                   gormlogger.Default.LogMode(gormlogger.Info),
 	})
 
 	if err != nil {
@@ -55,6 +50,7 @@ func NewServiceContext(c config.Config) *ServiceContext {
 		BotModel:          dao.Use(db),
 		BotsPromptModel:   dao.Use(db),
 		Knowledge:         dao.Use(db),
+		RequestLogger:     requestlogger.NewRequestLogger(db),
 		AccessLog:         middleware.NewAccessLogMiddleware().Handle,
 	}
 }

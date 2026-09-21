@@ -86,15 +86,15 @@ func (api *API) ChatMessagesStreamRaw(ctx context.Context, req *ChatMessageReque
 	}
 
 	// Add debug logging
-	fmt.Printf("[Coze V3 Stream] Request URL: %s\n", httpReq.URL.String())
-	fmt.Printf("[Coze V3 Stream] Request Method: %s\n", httpReq.Method)
+	// fmt.Printf("[Coze V3 Stream] Request URL: %s\n", httpReq.URL.String())
+	// fmt.Printf("[Coze V3 Stream] Request Method: %s\n", httpReq.Method)
 
 	// Print JSON body for debugging
-	if reqBody, err := json.MarshalIndent(req, "", "  "); err == nil {
-		fmt.Printf("[Coze V3 Stream] Request JSON Body:\n%s\n", string(reqBody))
-	} else {
-		fmt.Printf("[Coze V3 Stream] Request Body (error): %+v\n", req)
-	}
+	// if reqBody, err := json.MarshalIndent(req, "", "  "); err == nil {
+	// 	fmt.Printf("[Coze V3 Stream] Request JSON Body:\n%s\n", string(reqBody))
+	// } else {
+	// 	fmt.Printf("[Coze V3 Stream] Request Body (error): %+v\n", req)
+	// }
 
 	return api.c.sendRequest(httpReq)
 }
@@ -117,7 +117,7 @@ func (api *API) chatMessagesStreamHandle(ctx context.Context, resp *http.Respons
 	defer func(Body io.ReadCloser) {
 		err := Body.Close()
 		if err != nil {
-			fmt.Println("Error closing response body:", err)
+			// fmt.Println("Error closing response body:", err)
 		}
 	}(resp.Body)
 
@@ -152,13 +152,13 @@ func (api *API) chatMessagesStreamHandle(ctx context.Context, resp *http.Respons
 			}
 
 			// Debug: print raw line
-			fmt.Printf("[Coze Stream Raw] %s\n", line)
+			// fmt.Printf("[Coze Stream Raw] %s\n", line)
 
 			// Coze V3 uses SSE format with event and data lines
 			if strings.HasPrefix(line, "event:") {
 				currentEvent = strings.TrimPrefix(line, "event:")
 				currentEvent = strings.TrimSpace(currentEvent)
-				fmt.Printf("[Coze V3 Stream] Received event: '%s'\n", currentEvent)
+				// fmt.Printf("[Coze V3 Stream] Received event: '%s'\n", currentEvent)
 				continue
 			}
 
@@ -168,46 +168,45 @@ func (api *API) chatMessagesStreamHandle(ctx context.Context, resp *http.Respons
 
 				// Check for [DONE] marker - it can be a plain string or quoted
 				if data == "[DONE]" || data == `"[DONE]"` {
-					fmt.Println("[Coze V3 Stream] Received [DONE]")
+					// fmt.Println("[Coze V3 Stream] Received [DONE]")
 					return
 				}
 
 				// Print raw data before parsing
-				fmt.Printf("[Coze V3 Stream] Raw data: %s\n", data)
+				// fmt.Printf("[Coze V3 Stream] Raw data: %s\n", data)
 
 				var streamResp ChatMessageStreamResponse
 				if err := json.Unmarshal([]byte(data), &streamResp); err != nil {
-					fmt.Printf("[Coze V3 Stream] JSON decode error: %v, data: %s\n", err, data)
-					// Don't return on error, continue processing
+					// fmt.Printf("[Coze V3 Stream] JSON decode error: %v, data: %s\n", err, data)
 					continue
 				}
 
 				// Set the event type from the previous event line
 				streamResp.Event = currentEvent
 
-				fmt.Printf("[Coze V3 Stream] Parsed Event: '%s'\n", streamResp.Event)
-				if streamResp.Status != "" {
-					fmt.Printf("[Coze V3 Stream] Status: %s\n", streamResp.Status)
-				}
-				if streamResp.LastError != nil && streamResp.LastError.Code != 0 {
-					fmt.Printf("[Coze V3 Stream] Error: Code=%d, Msg=%s\n", streamResp.LastError.Code, streamResp.LastError.Msg)
-				}
-				if streamResp.Data != nil {
-					fmt.Printf("[Coze V3 Stream] Data Type: '%s', Role: '%s', ContentType: '%s', Content Length: %d\n",
-						streamResp.Data.Type, streamResp.Data.Role, streamResp.Data.ContentType, len(streamResp.Data.Content))
-					if len(streamResp.Data.Content) < 200 {
-						fmt.Printf("[Coze V3 Stream] Data Content: '%s'\n", streamResp.Data.Content)
-					} else {
-						fmt.Printf("[Coze V3 Stream] Data Content (first 200): '%s...'\n", streamResp.Data.Content[:200])
-					}
-				}
-				if streamResp.ConversationID != "" {
-					fmt.Printf("[Coze V3 Stream] Conversation ID: %s\n", streamResp.ConversationID)
-				}
-				// Log inserted_additional_messages if present
-				if len(streamResp.InsertedAdditionalMessages) > 0 {
-					fmt.Printf("[Coze V3 Stream] Inserted Messages: %+v\n", streamResp.InsertedAdditionalMessages)
-				}
+				// fmt.Printf("[Coze V3 Stream] Parsed Event: '%s'\n", streamResp.Event)
+				// if streamResp.Status != "" {
+				// 	fmt.Printf("[Coze V3 Stream] Status: %s\n", streamResp.Status)
+				// }
+				// if streamResp.LastError != nil && streamResp.LastError.Code != 0 {
+				// 	fmt.Printf("[Coze V3 Stream] Error: Code=%d, Msg=%s\n", streamResp.LastError.Code, streamResp.LastError.Msg)
+				// }
+				// if streamResp.Data != nil {
+				// 	fmt.Printf("[Coze V3 Stream] Data Type: '%s', Role: '%s', ContentType: '%s', Content Length: %d\n",
+				// 		streamResp.Data.Type, streamResp.Data.Role, streamResp.Data.ContentType, len(streamResp.Data.Content))
+				// 	if len(streamResp.Data.Content) < 200 {
+				// 		fmt.Printf("[Coze V3 Stream] Data Content: '%s'\n", streamResp.Data.Content)
+				// 	} else {
+				// 		fmt.Printf("[Coze V3 Stream] Data Content (first 200): '%s...'\n", streamResp.Data.Content[:200])
+				// 	}
+				// }
+				// if streamResp.ConversationID != "" {
+				// 	fmt.Printf("[Coze V3 Stream] Conversation ID: %s\n", streamResp.ConversationID)
+				// }
+				// // Log inserted_additional_messages if present
+				// if len(streamResp.InsertedAdditionalMessages) > 0 {
+				// 	fmt.Printf("[Coze V3 Stream] Inserted Messages: %+v\n", streamResp.InsertedAdditionalMessages)
+				// }
 
 				streamChannel <- ChatMessageStreamChannelResponse{
 					ChatMessageStreamResponse: streamResp,

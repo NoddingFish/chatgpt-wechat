@@ -14,15 +14,20 @@ import (
 	"time"
 
 	"chat/common/redis"
+	requestlogger "chat/common/requestlogger"
+	"chat/service/chat/model"
 
 	"github.com/golang-jwt/jwt/v4"
 	"github.com/google/uuid"
 	"github.com/whyiyhw/go-workwx"
 	"github.com/zeromicro/go-zero/core/logx"
+	"gorm.io/gorm"
 )
 
 var (
-	Token string
+	Token  string
+	LogDB  *gorm.DB
+	logger *requestlogger.RequestLogger
 
 	WeCom struct {
 		Port                int
@@ -43,6 +48,12 @@ var (
 		Company string
 	}
 )
+
+// InitDB 初始化数据库连接，用于日志记录
+func InitDB(db *gorm.DB) {
+	LogDB = db
+	logger = requestlogger.NewRequestLogger(db)
+}
 
 type Application struct {
 	AgentID            int64
@@ -233,28 +244,85 @@ func DealUserLastMessageByToken(token, openKfID string) {
 			logx.Info("客服消息-消息过期", v.SendTime, time.Now().Unix()-300)
 			continue
 		}
-		if v.Msgtype == "text" && v.Origin == 3 {
-			CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, v.Text.Content)
-		}
-		if v.Msgtype == "voice" && v.Origin == 3 {
-			filePath, err := DealCustomerVoiceMessageByMediaID(v.Voice.MediaId)
-			if err != nil {
-				logx.Info("音频文件读取失败", v.Voice.MediaId)
-				CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#direct:音频文件读取失败:"+err.Error())
-			} else {
-				CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#voice:"+filePath)
+
+		switch v.Origin {
+		case 3: // 客户消息
+			switch v.Msgtype {
+			case "text":
+				CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, v.Text.Content)
+			case "voice":
+				filePath, err := DealCustomerVoiceMessageByMediaID(v.Voice.MediaId)
+				if err != nil {
+					logx.Info("音频文件读取失败", v.Voice.MediaId)
+					CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#direct:音频文件读取失败:"+err.Error())
+				} else {
+					CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#voice:"+filePath)
+				}
+			case "image":
+				filePath, err := DealCustomerImageMessageByMediaID(v.Image.MediaId)
+				if err != nil {
+					logx.Info("图片文件读取失败", v.Image.MediaId)
+					CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#direct:图片文件读取失败:"+err.Error())
+				} else {
+					CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#image:"+filePath)
+				}
 			}
-		}
-		if v.Msgtype == "image" && v.Origin == 3 {
-			filePath, err := DealCustomerImageMessageByMediaID(v.Image.MediaId)
-			if err != nil {
-				logx.Info("图片文件读取失败", v.Image.MediaId)
-				CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#direct:图片文件读取失败:"+err.Error())
-			} else {
-				CustomerCallLogic(v.ExternalUserid, v.OpenKfid, v.Msgid, "#image:"+filePath)
+		case 2: // 人工客服消息
+			msgContent := ""
+			switch v.Msgtype {
+			case "text":
+				msgContent = v.Text.Content
+			case "voice":
+				msgContent = fmt.Sprintf("[语音消息] media_id: %s", v.Voice.MediaId)
+			case "image":
+				msgContent = fmt.Sprintf("[图片消息] media_id: %s", v.Image.MediaId)
+			default:
+				msgContent = fmt.Sprintf("[%s消息]", v.Msgtype)
 			}
+			logHumanChatMsg(v.ExternalUserid, v.OpenKfid, v.Msgid, v.Msgtype, msgContent, v.SendTime)
+		case 1: // AI助手消息（系统自动发出），跳过
+			// 不记录，由各自的AI通道记录
 		}
 	}
+}
+
+// logHumanChatMsg 记录人工客服对话消息
+func logHumanChatMsg(userID, openKfID, msgID, msgType, content string, sendTime int64) {
+	if logger == nil {
+		return
+	}
+
+	ctx := context.Background()
+
+	logx.Info("记录人工客服对话",
+		"user_id", userID,
+		"open_kf_id", openKfID,
+		"content", content,
+		"msg_type", msgType,
+		"send_time", sendTime,
+	)
+
+	reqLog := &model.RequestLog{
+		RequestType:      "human_chat",
+		UserID:           userID,
+		UserType:         "customer",
+		AgentID:          0,
+		Channel:          "human",
+		ModelName:        "",
+		ReqContent:       content,
+		ReqContentLength: len([]rune(content)),
+		IsVoice:          msgType == "voice",
+		ResContent:       "",
+		ResContentLength: 0,
+		Status:           "success",
+		LatencyMs:        0,
+		ConversationID:   openKfID,
+		TransferID:       "",
+		CreatedAt:        time.Unix(sendTime, 0),
+		UpdatedAt:        time.Unix(sendTime, 0),
+	}
+
+	logger.LogRequest(ctx, reqLog)
 }
 
 // SendCustomerChatMessage 发送客服消息
@@ -861,6 +929,7 @@ func getCustomerApp() (*workwx.WorkwxApp, bool) {
 //   - 1: 由AI接待
 //   - 2: 在待接入池中排队等待接待人员接入（可选择转为指定人员接待）
 //   - 3: 人工接待中，直接指定接待人员（接待人员须处于"正在接待"中）
+//
 // servicerUserID: 接待人员的userid，当state=3时必填，第三方应用填密文userid（open_userid）
 func TransferToHumanServiceState(openKfID, externalUserID string, serviceState int, servicerUserID string) error {
 	app, ok := getCustomerApp()

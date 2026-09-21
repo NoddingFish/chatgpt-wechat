@@ -186,30 +186,30 @@ func (api *API) ChatMessages(ctx context.Context, req *ChatMessageRequest) (resp
 	}
 
 	// Add debug logging - print full request details
-	fmt.Printf("[Coze V3 API] Request URL: %s\n", httpReq.URL.String())
-	fmt.Printf("[Coze V3 API] Request Method: %s\n", httpReq.Method)
-	fmt.Printf("[Coze V3 API] Request Headers: Authorization=%s, Content-Type=%s\n",
-		httpReq.Header.Get("Authorization"), httpReq.Header.Get("Content-Type"))
+	// fmt.Printf("[Coze V3 API] Request URL: %s\n", httpReq.URL.String())
+	// fmt.Printf("[Coze V3 API] Request Method: %s\n", httpReq.Method)
+	// fmt.Printf("[Coze V3 API] Request Headers: Authorization=%s, Content-Type=%s\n",
+	// 	httpReq.Header.Get("Authorization"), httpReq.Header.Get("Content-Type"))
 
 	// Print JSON body for debugging
-	if reqBody, err := json.MarshalIndent(req, "", "  "); err == nil {
-		fmt.Printf("[Coze V3 API] Request JSON Body:\n%s\n", string(reqBody))
-	} else {
-		fmt.Printf("[Coze V3 API] Request Body: %+v\n", req)
-	}
+	// if reqBody, err := json.MarshalIndent(req, "", "  "); err == nil {
+	// 	fmt.Printf("[Coze V3 API] Request JSON Body:\n%s\n", string(reqBody))
+	// } else {
+	// 	fmt.Printf("[Coze V3 API] Request Body: %+v\n", req)
+	// }
 
 	err = api.c.sendJSONRequest(httpReq, &resp)
 	if err != nil {
-		fmt.Printf("[Coze V3 API] Error: %v\n", err)
+		// fmt.Printf("[Coze V3 API] Error: %v\n", err)
 	}
 	if resp != nil {
-		fmt.Printf("[Coze V3 API] Response Code: %d, Message: %s\n", resp.Code, resp.Message)
-		if resp.Code == 0 {
-			fmt.Printf("[Coze V3 API] Full Response Data: %+v\n", resp.Data)
-			fmt.Printf("[Coze V3 API] Conversation ID: %s, Status: %s\n", resp.Data.ConversationID, resp.Data.Status)
-		} else {
-			fmt.Printf("[Coze V3 API] Error Details - Code: %d, Msg: %s\n", resp.Data.LastError.Code, resp.Data.LastError.Msg)
-		}
+		// fmt.Printf("[Coze V3 API] Response Code: %d, Message: %s\n", resp.Code, resp.Message)
+		// if resp.Code == 0 {
+		// 	fmt.Printf("[Coze V3 API] Full Response Data: %+v\n", resp.Data)
+		// 	fmt.Printf("[Coze V3 API] Conversation ID: %s, Status: %s\n", resp.Data.ConversationID, resp.Data.Status)
+		// } else {
+		// 	fmt.Printf("[Coze V3 API] Error Details - Code: %d, Msg: %s\n", resp.Data.LastError.Code, resp.Data.LastError.Msg)
+		// }
 	}
 	return
 }
@@ -220,8 +220,8 @@ func (api *API) GetMessageList(ctx context.Context, conversationID string, botID
 	// 注意：这里应该使用 conversation_id，但某些情况下可能需要 section_id
 	url := fmt.Sprintf("/v3/chat/message/list?conversation_id=%s&bot_id=%s", conversationID, botID)
 
-	fmt.Printf("[Coze V3 GetMessageList] Request - ConversationID: %s, BotID: %s\n", conversationID, botID)
-	fmt.Printf("[Coze V3 GetMessageList] Request URL: %s\n", url)
+	// fmt.Printf("[Coze V3 GetMessageList] Request - ConversationID: %s, BotID: %s\n", conversationID, botID)
+	// fmt.Printf("[Coze V3 GetMessageList] Request URL: %s\n", url)
 
 	// 创建 GET 请求，不需要请求体
 	httpReq, err := api.createBaseRequest(ctx, http.MethodGet, url, nil)
@@ -231,28 +231,28 @@ func (api *API) GetMessageList(ctx context.Context, conversationID string, botID
 
 	err = api.c.sendJSONRequest(httpReq, &resp)
 	if err != nil {
-		fmt.Printf("[Coze V3 GetMessageList] Error: %v\n", err)
+		// fmt.Printf("[Coze V3 GetMessageList] Error: %v\n", err)
 		return
 	}
 
 	if resp != nil {
-		fmt.Printf("[Coze V3 GetMessageList] Response Code: %d, Message: %s\n", resp.Code, resp.Message)
-		if resp.Code == 0 {
-			// 解析 Data 字段
-			data, err := resp.GetMessageListData()
-			if err != nil {
-				fmt.Printf("[Coze V3 GetMessageList] Parse Data Error: %v\n", err)
-				fmt.Printf("[Coze V3 GetMessageList] Raw Data: %+v\n", resp.Data)
-			} else {
-				fmt.Printf("[Coze V3 GetMessageList] Retrieved %d messages\n", len(data.Items))
-				for i, msg := range data.Items {
-					fmt.Printf("[Coze V3 Message %d] ID=%s, Role=%s, Type=%s, ContentType=%s, Content=%s\n",
-						i, msg.ID, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent())
-				}
-			}
-		} else {
-			fmt.Printf("[Coze V3 GetMessageList] Error Response: %+v\n", resp)
-		}
+		// fmt.Printf("[Coze V3 GetMessageList] Response Code: %d, Message: %s\n", resp.Code, resp.Message)
+		// if resp.Code == 0 {
+		// 	// 解析 Data 字段
+		// 	data, err := resp.GetMessageListData()
+		// 	if err != nil {
+		// 		fmt.Printf("[Coze V3 GetMessageList] Parse Data Error: %v\n", err)
+		// 		fmt.Printf("[Coze V3 GetMessageList] Raw Data: %+v\n", resp.Data)
+		// 	} else {
+		// 		fmt.Printf("[Coze V3 GetMessageList] Retrieved %d messages\n", len(data.Items))
+		// 		for i, msg := range data.Items {
+		// 			fmt.Printf("[Coze V3 Message %d] ID=%s, Role=%s, Type=%s, ContentType=%s, Content=%s\n",
+		// 				i, msg.ID, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent())
+		// 		}
+		// 	}
+		// } else {
+		// 	fmt.Printf("[Coze V3 GetMessageList] Error Response: %+v\n", resp)
+		// }
 	}
 	return
 }
@@ -264,8 +264,8 @@ func (api *API) GetMessageListByChatID(ctx context.Context, chatID string, conve
 	// 参考: https://www.coze.cn/docs/developer_guides/chat_message_list
 	url := fmt.Sprintf("/v3/chat/message/list?conversation_id=%s&chat_id=%s&bot_id=%s", conversationID, chatID, botID)
 
-	fmt.Printf("[Coze V3 GetMessageListByChatID] Request - ChatID: %s, ConversationID: %s, BotID: %s\n", chatID, conversationID, botID)
-	fmt.Printf("[Coze V3 GetMessageListByChatID] Request URL: %s\n", url)
+	// fmt.Printf("[Coze V3 GetMessageListByChatID] Request - ChatID: %s, ConversationID: %s, BotID: %s\n", chatID, conversationID, botID)
+	// fmt.Printf("[Coze V3 GetMessageListByChatID] Request URL: %s\n", url)
 
 	// 创建 GET 请求，不需要请求体
 	httpReq, err := api.createBaseRequest(ctx, http.MethodGet, url, nil)
@@ -275,28 +275,28 @@ func (api *API) GetMessageListByChatID(ctx context.Context, chatID string, conve
 
 	err = api.c.sendJSONRequest(httpReq, &resp)
 	if err != nil {
-		fmt.Printf("[Coze V3 GetMessageListByChatID] Error: %v\n", err)
+		// fmt.Printf("[Coze V3 GetMessageListByChatID] Error: %v\n", err)
 		return
 	}
 
 	if resp != nil {
-		fmt.Printf("[Coze V3 GetMessageListByChatID] Response Code: %d, Message: %s\n", resp.Code, resp.Message)
-		if resp.Code == 0 {
-			// 解析 Data 字段
-			data, err := resp.GetMessageListData()
-			if err != nil {
-				fmt.Printf("[Coze V3 GetMessageListByChatID] Parse Data Error: %v\n", err)
-				fmt.Printf("[Coze V3 GetMessageListByChatID] Raw Data: %+v\n", resp.Data)
-			} else {
-				fmt.Printf("[Coze V3 GetMessageListByChatID] Retrieved %d messages\n", len(data.Items))
-				for i, msg := range data.Items {
-					fmt.Printf("[Coze V3 Message %d] ID=%s, Role=%s, Type=%s, ContentType=%s, Content=%s\n",
-						i, msg.ID, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent())
-				}
-			}
-		} else {
-			fmt.Printf("[Coze V3 GetMessageListByChatID] Error Response: %+v\n", resp)
-		}
+		// fmt.Printf("[Coze V3 GetMessageListByChatID] Response Code: %d, Message: %s\n", resp.Code, resp.Message)
+		// if resp.Code == 0 {
+		// 	// 解析 Data 字段
+		// 	data, err := resp.GetMessageListData()
+		// 	if err != nil {
+		// 		fmt.Printf("[Coze V3 GetMessageListByChatID] Parse Data Error: %v\n", err)
+		// 		fmt.Printf("[Coze V3 GetMessageListByChatID] Raw Data: %+v\n", resp.Data)
+		// 	} else {
+		// 		fmt.Printf("[Coze V3 GetMessageListByChatID] Retrieved %d messages\n", len(data.Items))
+		// 		for i, msg := range data.Items {
+		// 			fmt.Printf("[Coze V3 Message %d] ID=%s, Role=%s, Type=%s, ContentType=%s, Content=%s\n",
+		// 				i, msg.ID, msg.Role, msg.Type, msg.ContentType, msg.GetTextContent())
+		// 		}
+		// 	}
+		// } else {
+		// 	fmt.Printf("[Coze V3 GetMessageListByChatID] Error Response: %+v\n", resp)
+		// }
 	}
 	return
 }
@@ -306,7 +306,7 @@ func (api *API) GetMessageListWithRetry(ctx context.Context, conversationID stri
 	for i := 0; i < maxRetries; i++ {
 		if i > 0 {
 			// 等待一段时间后重试
-			fmt.Printf("[Coze V3 GetMessageList] Retry %d/%d after delay...\n", i, maxRetries)
+			// fmt.Printf("[Coze V3 GetMessageList] Retry %d/%d after delay...\n", i, maxRetries)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -330,7 +330,7 @@ func (api *API) GetMessageListWithRetry(ctx context.Context, conversationID stri
 
 		// 如果是无效聊天错误，继续重试
 		if resp.Code == 4001 {
-			fmt.Printf("[Coze V3 GetMessageList] Got invalid chat error, will retry...\n")
+			// fmt.Printf("[Coze V3 GetMessageList] Got invalid chat error, will retry...\n")
 			continue
 		}
 
