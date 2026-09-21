@@ -52,11 +52,9 @@ func ParseAndExec(s string, uid int, m *bucket.MapBucket) error {
 // ParseAndAuth 解析并认证
 func ParseAndAuth(s string, fd int, c *gws.Conn, unAuth, auth *bucket.MapBucket, authFc AuthFunc) error {
 	r := Auth{}
-	fmt.Printf("client:%d send msg:%s", fd, s)
 	err := json.Unmarshal([]byte(s), &r)
 
 	if err != nil {
-		fmt.Printf("client:%d send msg:%s", fd, s)
 		return fmt.Errorf("auth fail param error")
 	}
 
@@ -64,7 +62,6 @@ func ParseAndAuth(s string, fd int, c *gws.Conn, unAuth, auth *bucket.MapBucket,
 
 		id, err := authFc.GetIdByToken(r.Token)
 		if err != nil {
-			fmt.Printf("client:%d send msg:%s", fd, s)
 			return fmt.Errorf("auth fail token error")
 		}
 		fmt.Println(id, "用户认证成功~")

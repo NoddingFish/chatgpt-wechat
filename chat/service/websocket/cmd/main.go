@@ -57,7 +57,9 @@ func main() {
 				fmt.Println(err)
 				return 0, err
 			}
-			fmt.Println(string(body))
+			if res.StatusCode != http.StatusOK {
+				return 0, fmt.Errorf("authentication service returned HTTP %d", res.StatusCode)
+			}
 			type jsonDataType struct {
 				Code int    `json:"code"`
 				Msg  string `json:"msg"`
@@ -71,6 +73,9 @@ func main() {
 			err = json.Unmarshal(body, &userData)
 			if err != nil {
 				return 0, err
+			}
+			if userData.Code != http.StatusOK || userData.Data.ID <= 0 {
+				return 0, fmt.Errorf("authentication failed: %s", userData.Msg)
 			}
 
 			return userData.Data.ID, nil

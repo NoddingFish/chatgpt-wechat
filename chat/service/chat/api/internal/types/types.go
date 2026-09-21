@@ -202,10 +202,10 @@ type CustomerChatReply struct {
 }
 
 type CustomerChatReq struct {
-	MsgID      string `json:"msg_id" label:"消息标识"`
-	Msg        string `json:"msg" label:"消息"`
-	CustomerID string `json:"customer_id" label:"客户标识"`
-	OpenKfID   string `json:"open_kf_id" label:"客服标识"`
+	MsgID      string `json:"msg_id" validate:"required,max=191" label:"消息标识"`
+	Msg        string `json:"msg" validate:"required" label:"消息"`
+	CustomerID string `json:"customer_id" validate:"required,max=191" label:"客户标识"`
+	OpenKfID   string `json:"open_kf_id" validate:"required,max=191" label:"客服标识"`
 }
 
 type ExploreListBot struct {

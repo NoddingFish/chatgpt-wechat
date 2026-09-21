@@ -181,8 +181,23 @@ func (api *API) chatMessagesStreamHandle(ctx context.Context, resp *http.Respons
 					continue
 				}
 
-				// Set the event type from the previous event line
+				// Set the event type from the previous event line.
 				streamResp.Event = currentEvent
+
+				// Coze 的消息事件存在两种载荷格式：字段直接位于根级，或位于 data 中。
+				// 统一归一化到 Data，避免上层遗漏根级流式回答而退化为再次拉取消息列表。
+				if streamResp.Data == nil && (streamResp.Content != "" || streamResp.Role != "" || streamResp.Type != "") {
+					streamResp.Data = &StreamEventData{
+						ID:             streamResp.ID,
+						ConversationID: streamResp.ConversationID,
+						BotID:          streamResp.BotID,
+						Role:           streamResp.Role,
+						Type:           streamResp.Type,
+						Content:        streamResp.Content,
+						ContentType:    streamResp.ContentType,
+						CreatedAt:      streamResp.CreatedAt,
+					}
+				}
 
 				// fmt.Printf("[Coze V3 Stream] Parsed Event: '%s'\n", streamResp.Event)
 				// if streamResp.Status != "" {

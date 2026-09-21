@@ -139,11 +139,13 @@ func (m *MapBucket) EachSendMsg(str string, ids []int) int {
 }
 
 func (m *MapBucket) EachDelete(layer time.Duration) { // 遍历map
-	m.RLock() //遍历期间一直持有读锁
-	defer m.RUnlock()
+	// 该方法会删除元素，必须持有写锁；RLock 下写 map 会产生数据竞争，严重时会崩溃。
+	m.Lock()
+	defer m.Unlock()
 
+	deadline := time.Now().Local().Add(layer)
 	for k, v := range m.Buckets {
-		if v.UpdatedAt.Before(time.Now().Local().Add(layer)) {
+		if v.UpdatedAt.Before(deadline) {
 			_, _ = v.Conn.Write(response.Error(503, "连接超时"))
 			delete(m.Buckets, k)
 		} else {

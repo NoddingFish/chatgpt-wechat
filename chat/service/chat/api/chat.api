@@ -34,6 +34,10 @@ service chat-api {
 	jwt:        Auth // jwt中间件声明
 )
 service chat-api {
+	// 咨询统计：period=week/month，或 start_date/end_date=YYYY-MM-DD
+	@handler ConsultationStatsHandler
+	get /stats/consultations (ConsultationStatsReq) returns (ConsultationStatsReply)
+
 	@handler ChatHandler
 	post /msg/push (ChatReq) returns (ChatReply)
 

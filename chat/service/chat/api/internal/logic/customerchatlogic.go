@@ -106,6 +106,14 @@ func (l *CustomerChatLogic) updateTransferLog(transferLog *model.TransferLog, st
 	l.svcCtx.RequestLogger.LogTransfer(context.Background(), transferLog)
 }
 
+// logFirstPacketLatency 仅在收到首个有效模型响应事件时记录一次。
+func (l *CustomerChatLogic) logFirstPacketLatency(reqLog *model.RequestLog, startedAt time.Time) {
+	if reqLog == nil || reqLog.FirstPacketLatencyMs > 0 {
+		return
+	}
+	reqLog.FirstPacketLatencyMs = int(time.Since(startedAt).Milliseconds())
+}
+
 // logAIRequestEnd 更新AI请求完成状态
 func (l *CustomerChatLogic) logAIRequestEnd(reqLog *model.RequestLog, resContent string, status string, latencyMs int, tokenInfo ...int) {
 	if reqLog == nil || l.svcCtx.RequestLogger == nil {
@@ -132,6 +140,8 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 	l.setModelName().setBasePrompt().setBaseHost()
 
+	// 企业微信可能重复推送同一条消息。先用原有聊天记录兼容历史数据，再以 SET NX
+	// 原子占位，防止并发回调导致重复调用模型或重复转人工。
 	table := l.svcCtx.ChatModel.Chat
 	_, err = table.WithContext(context.Background()).
 		Where(table.MessageID.Eq(req.MsgID)).Where(table.User.Eq(req.CustomerID)).First()
@@ -139,6 +149,14 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 		return &types.CustomerChatReply{
 			Message: "ok",
 		}, nil
+	}
+	idempotencyKey := fmt.Sprintf("chat:customer:message:%s:%s", req.CustomerID, req.MsgID)
+	firstDelivery, redisErr := redis.Rdb.SetNX(l.ctx, idempotencyKey, "1", 7*24*time.Hour).Result()
+	if redisErr != nil {
+		return nil, fmt.Errorf("set message idempotency key: %w", redisErr)
+	}
+	if !firstDelivery {
+		return &types.CustomerChatReply{Message: "ok"}, nil
 	}
 
 	fmt.Printf("[对话] 用户: %s\n", req.Msg)
@@ -381,6 +399,7 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 		}
 		if conversationId != "" {
 			request.ConversationID = conversationId
+			reqLog.ConversationID = conversationId
 			// l.Logger.Info("Coze 请求中使用历史会话 ID: ", request.ConversationID)
 		} else {
 			// l.Logger.Info("Coze 请求将创建新会话（无历史会话 ID）")
@@ -476,6 +495,15 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 					// 	}
 					// }
 
+					if response.Data != nil && response.Data.Role == "assistant" && response.Data.Type == "answer" && response.Data.Content != "" {
+						l.logFirstPacketLatency(reqLog, reqStartTime)
+					}
+					if response.Usage != nil {
+						reqLog.PromptTokens = response.Usage.InputCount
+						reqLog.CompletionTokens = response.Usage.OutputCount
+						reqLog.TotalTokens = response.Usage.TokenCount
+					}
+
 					if response.LastError != nil && response.LastError.Code != 0 {
 						errMsg := fmt.Sprintf("Coze API 错误 [%d]: %s", response.LastError.Code, response.LastError.Msg)
 						l.logAIRequestEnd(reqLog, errMsg, "failed", int(time.Since(reqStartTime).Milliseconds()))
@@ -493,6 +521,7 @@ func (l *CustomerChatLogic) CustomerChat(req *types.CustomerChatReq) (resp *type
 
 					if response.ConversationID != "" {
 						newConversationID = response.ConversationID
+						reqLog.ConversationID = response.ConversationID
 
 						if request.ConversationID == "" {
 							// l.Logger.Info("Coze V3 创建新会话 ID: ", response.ConversationID)

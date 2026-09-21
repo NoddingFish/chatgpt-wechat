@@ -34,6 +34,11 @@ func RegisterHandlers(server *rest.Server, serverCtx *svc.ServiceContext) {
 			[]rest.Middleware{serverCtx.AccessLog},
 			[]rest.Route{
 				{
+					Method:  http.MethodGet,
+					Path:    "/stats/consultations",
+					Handler: ConsultationStatsHandler(serverCtx),
+				},
+				{
 					Method:  http.MethodPost,
 					Path:    "/bot/chat",
 					Handler: BotChatHandler(serverCtx),

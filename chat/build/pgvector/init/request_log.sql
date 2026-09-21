@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS request_log
     status              varchar(20)  NOT NULL DEFAULT 'success',
     error_msg           text,
     latency_ms          int          NOT NULL DEFAULT 0,
+    first_packet_latency_ms int       NOT NULL DEFAULT 0,
     prompt_tokens       int          NOT NULL DEFAULT 0,
     completion_tokens   int          NOT NULL DEFAULT 0,
     total_tokens        int          NOT NULL DEFAULT 0,
@@ -41,7 +42,8 @@ COMMENT ON COLUMN request_log.res_content IS 'AI响应内容';
 COMMENT ON COLUMN request_log.res_content_length IS '响应内容长度';
 COMMENT ON COLUMN request_log.status IS '处理状态: success/failed/timeout';
 COMMENT ON COLUMN request_log.error_msg IS '错误信息';
-COMMENT ON COLUMN request_log.latency_ms IS '响应耗时(毫秒)';
+COMMENT ON COLUMN request_log.latency_ms IS '完整响应耗时(毫秒)';
+COMMENT ON COLUMN request_log.first_packet_latency_ms IS '收到模型首个响应包耗时(毫秒)，0表示未采集';
 COMMENT ON COLUMN request_log.prompt_tokens IS '消耗prompt token数';
 COMMENT ON COLUMN request_log.completion_tokens IS '消耗completion token数';
 COMMENT ON COLUMN request_log.total_tokens IS '总消耗token数';

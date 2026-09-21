@@ -39,7 +39,7 @@ func (l *RequestLogger) LogRequest(ctx context.Context, req *model.RequestLog) {
 	result := l.db.WithContext(ctx).
 		Clauses(clause.OnConflict{
 			Columns:   []clause.Column{{Name: "request_id"}},
-			DoUpdates: clause.AssignmentColumns([]string{"request_type", "res_content", "res_content_length", "status", "error_msg", "latency_ms", "prompt_tokens", "completion_tokens", "total_tokens", "conversation_id", "transfer_id", "updated_at"}),
+			DoUpdates: clause.AssignmentColumns([]string{"request_type", "res_content", "res_content_length", "status", "error_msg", "latency_ms", "first_packet_latency_ms", "prompt_tokens", "completion_tokens", "total_tokens", "conversation_id", "transfer_id", "updated_at"}),
 		}).
 		Create(req)
 	if result.Error != nil {

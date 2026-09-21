@@ -78,6 +78,14 @@ func (l *ChatLogic) logAIRequestStart(req *types.ChatReq) *model.RequestLog {
 	return reqLog
 }
 
+// logFirstPacketLatency 仅在收到首个有效模型响应事件时记录一次。
+func (l *ChatLogic) logFirstPacketLatency(reqLog *model.RequestLog, startedAt time.Time) {
+	if reqLog == nil || reqLog.FirstPacketLatencyMs > 0 {
+		return
+	}
+	reqLog.FirstPacketLatencyMs = int(time.Since(startedAt).Milliseconds())
+}
+
 // logAIRequestEnd 更新AI请求完成状态
 func (l *ChatLogic) logAIRequestEnd(reqLog *model.RequestLog, resContent string, status string, latencyMs int, tokenInfo ...int) {
 	if reqLog == nil || l.svcCtx.RequestLogger == nil {
@@ -853,6 +861,7 @@ func (l *ChatLogic) Chat(req *types.ChatReq) (resp *types.ChatReply, err error) 
 		}
 		if conversationId != "" {
 			request.ConversationID = conversationId
+			reqLog.ConversationID = conversationId
 		}
 
 		// fmt.Println("\n========== [Coze V3 API 请求详情] ==========")
@@ -897,6 +906,15 @@ func (l *ChatLogic) Chat(req *types.ChatReq) (resp *types.ChatReply, err error) 
 						return
 					}
 
+					if response.Data != nil && response.Data.Role == "assistant" && response.Data.Type == "answer" && response.Data.Content != "" {
+						l.logFirstPacketLatency(reqLog, reqStartTime)
+					}
+					if response.Usage != nil {
+						reqLog.PromptTokens = response.Usage.InputCount
+						reqLog.CompletionTokens = response.Usage.OutputCount
+						reqLog.TotalTokens = response.Usage.TokenCount
+					}
+
 					if response.LastError != nil && response.LastError.Code != 0 {
 						errMsg := fmt.Sprintf("Coze API 错误 [%d]: %s", response.LastError.Code, response.LastError.Msg)
 						l.logAIRequestEnd(reqLog, errMsg, "failed", int(time.Since(reqStartTime).Milliseconds()))
@@ -913,6 +931,7 @@ func (l *ChatLogic) Chat(req *types.ChatReq) (resp *types.ChatReply, err error) 
 					}
 
 					if response.ConversationID != "" {
+						reqLog.ConversationID = response.ConversationID
 						// if request.ConversationID != "" && response.ConversationID != request.ConversationID {
 						// 	l.Logger.Error(fmt.Sprintf("⚠️ Coze V3 返回的会话 ID 与请求不同！请求: %s, 响应: %s",
 						// 		request.ConversationID, response.ConversationID))
